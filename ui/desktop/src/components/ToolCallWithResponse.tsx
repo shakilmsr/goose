@@ -676,16 +676,16 @@ function ToolCallView({
         }
         break;
 
-      case 'delegate': {
-        if (args.instructions) {
-          const instr = getStringValue(args.instructions);
-          const truncated = instr.length > 80 ? instr.substring(0, 80) + '…' : instr;
-          return `delegating: ${truncated}`;
-        }
+      case 'swarm_execute': {
         if (args.source) {
-          return `delegating to ${getStringValue(args.source)}`;
+          return `running swarm with ${getStringValue(args.source)}`;
         }
-        return 'delegating task';
+        if (args.task) {
+          const task = getStringValue(args.task);
+          const truncated = task.length > 80 ? task.substring(0, 80) + '…' : task;
+          return `running swarm: ${truncated}`;
+        }
+        return 'running swarm';
       }
 
       case 'load': {

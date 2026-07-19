@@ -26,6 +26,9 @@ pub fn usable_budget(context_limit: usize) -> usize {
     ((context_limit as f64 * USABLE_CONTEXT_FRACTION) as usize).max(256)
 }
 
+/// Upper bound on subtasks in any plan, LLM-authored or caller-supplied.
+pub const MAX_SUBTASKS: usize = 16;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubTask {
     pub id: String,
@@ -51,6 +54,14 @@ pub struct SubTask {
     /// enabled extensions. Empty means inherit everything.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_extensions: Vec<String>,
+    /// Named source (subrecipe, recipe, or agent) this subtask runs instead of a
+    /// purely ad-hoc worker. Resolution to a real recipe happens in the
+    /// integration layer before dispatch; an unknown name fails the run early.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Template parameters for `source`. Ignored without a source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<HashMap<String, serde_json::Value>>,
 }
 
 impl SubTask {
@@ -64,6 +75,8 @@ impl SubTask {
             output_schema: None,
             workspace_writes: Vec::new(),
             required_extensions: Vec::new(),
+            source: None,
+            parameters: None,
         }
     }
 }
@@ -193,6 +206,21 @@ impl Decomposer for StructuralDecomposer {
             return Err(anyhow!("cannot decompose an empty task"));
         }
         Ok(subtasks)
+    }
+}
+
+/// A pre-validated plan passed through unchanged — the no-planner fast path for
+/// callers that supply their own subtask graph (already run through
+/// [`parse_subtask_plan`]).
+pub struct FixedPlan(pub Vec<SubTask>);
+
+#[async_trait::async_trait]
+impl Decomposer for FixedPlan {
+    async fn decompose(&self, _task: &str) -> Result<Vec<SubTask>> {
+        if self.0.is_empty() {
+            return Err(anyhow!("fixed plan contains no subtasks"));
+        }
+        Ok(self.0.clone())
     }
 }
 
@@ -445,7 +473,7 @@ impl SemanticDecomposer {
         Self {
             provider,
             model_config,
-            max_subtasks: 16,
+            max_subtasks: MAX_SUBTASKS,
             subtask_budget,
             available_extensions: Vec::new(),
         }
@@ -495,6 +523,10 @@ struct RawPlanEntry {
     workspace_writes: Vec<String>,
     #[serde(default)]
     required_extensions: Vec<String>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    parameters: Option<HashMap<String, serde_json::Value>>,
 }
 
 /// Keep only sane relative paths: non-empty, not absolute, no parent traversal.
@@ -586,9 +618,28 @@ pub fn parse_subtask_plan(
 
     let mut subtasks = Vec::with_capacity(raw.len());
     for (i, entry) in raw.iter().enumerate() {
-        if entry.instruction.trim().is_empty() {
+        let source = entry
+            .source
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        if entry.instruction.trim().is_empty() && source.is_none() {
             return None;
         }
+        let instruction = if entry.instruction.trim().is_empty() {
+            format!("Run source '{}'", source.as_deref().unwrap_or_default())
+        } else {
+            entry.instruction.trim().to_string()
+        };
+        let parameters = if source.is_some() {
+            entry.parameters.clone()
+        } else {
+            if entry.parameters.is_some() {
+                tracing::warn!(entry = i, "dropping 'parameters' on entry without 'source'");
+            }
+            None
+        };
         let mut deps: Vec<String> = Vec::new();
         let push_dep = |deps: &mut Vec<String>, d: String| {
             if !deps.contains(&d) {
@@ -615,13 +666,15 @@ pub fn parse_subtask_plan(
         }
         subtasks.push(SubTask {
             id: ids[i].clone(),
-            instruction: entry.instruction.trim().to_string(),
+            instruction,
             content: entry.content.trim().to_string(),
             role: entry.role.trim().to_string(),
             dependencies: deps,
             output_schema: validated_output_schema(entry.output_schema.clone(), i),
             workspace_writes: sanitized_write_lanes(&entry.workspace_writes),
             required_extensions: known_extensions(&entry.required_extensions, available_extensions),
+            source,
+            parameters,
         });
     }
 

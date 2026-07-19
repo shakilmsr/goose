@@ -13,7 +13,10 @@ use crate::recipe::{Recipe, RecipeParameter, Response, Settings, RECIPE_FILE_EXT
 use crate::session::extension_data::EnabledExtensionsState;
 use crate::session::SessionType;
 use crate::sources::parse_frontmatter;
-use crate::swarm::decompose::{usable_budget, SemanticDecomposer, SubTask};
+use crate::swarm::decompose::{
+    parse_subtask_plan, usable_budget, Decomposer, FixedPlan, SemanticDecomposer, SubTask,
+    MAX_SUBTASKS,
+};
 use crate::swarm::envelope::{envelope_schema_for, interpret_subtask_output, SubtaskOutcome};
 use crate::swarm::kernel::{AgentSpawner, Kernel, SubtaskResult, SwarmReport};
 use crate::swarm::roster::AgentConfig as SwarmAgentConfig;
@@ -52,25 +55,30 @@ fn kind_plural(kind: SourceType) -> &'static str {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
-pub struct DelegateParams {
+/// Internal knobs for building one subagent run (recipe + task config). This
+/// was the `delegate` tool's parameter surface; the tool is gone but the swarm
+/// spawner and source resolution run on the same machinery.
+#[derive(Debug, Default)]
+pub struct SubagentParams {
     pub instructions: Option<String>,
-    pub source: Option<String>,
     pub parameters: Option<HashMap<String, serde_json::Value>>,
     pub extensions: Option<Vec<String>>,
     pub provider: Option<String>,
     pub model: Option<String>,
     pub temperature: Option<f32>,
     pub max_turns: Option<usize>,
-    pub context: Option<String>,
     pub working_dir: Option<String>,
-    #[serde(default)]
-    pub r#async: bool,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct SwarmExecuteParams {
     pub task: String,
+    #[serde(default)]
+    pub subtasks: Option<serde_json::Value>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub parameters: Option<HashMap<String, serde_json::Value>>,
     #[serde(default)]
     pub provider: Option<String>,
     #[serde(default)]
@@ -83,6 +91,36 @@ pub struct SwarmExecuteParams {
     pub max_duration_secs: Option<u64>,
     #[serde(default)]
     pub max_concurrent_subtasks: Option<usize>,
+    #[serde(default)]
+    pub r#async: bool,
+}
+
+/// Validate a caller-supplied subtask plan. Unlike the LLM path there is no
+/// fallback: an explicit plan that fails validation is an error the caller can
+/// fix, not something to silently replace.
+fn parse_explicit_subtasks(
+    value: &serde_json::Value,
+    available_extensions: &[String],
+) -> Result<Vec<SubTask>, String> {
+    let arr = value
+        .as_array()
+        .ok_or("'subtasks' must be a JSON array of subtask objects")?;
+    if arr.is_empty() {
+        return Err("'subtasks' must not be empty".to_string());
+    }
+    if arr.len() > MAX_SUBTASKS {
+        return Err(format!(
+            "'subtasks' supports at most {} entries (got {})",
+            MAX_SUBTASKS,
+            arr.len()
+        ));
+    }
+    let text = serde_json::to_string(value).map_err(|e| e.to_string())?;
+    parse_subtask_plan(&text, MAX_SUBTASKS, available_extensions).ok_or_else(|| {
+        "'subtasks' is not a valid plan: every entry needs a non-empty 'instruction', \
+         and 'depends_on' (zero-based indices) must reference other entries without cycles"
+            .to_string()
+    })
 }
 
 pub struct BackgroundTask {
@@ -333,14 +371,6 @@ pub fn discover_filesystem_sources(working_dir: &Path) -> Vec<SourceEntry> {
     sources
 }
 
-fn build_instructions_with_context(context: &str, instructions: &str) -> String {
-    let mut result = format!("# Reference Context\n\n{}", context);
-    if !instructions.is_empty() {
-        result.push_str(&format!("\n\n# Task Instructions\n\n{}", instructions));
-    }
-    result
-}
-
 fn build_subagent_instructions(session: Option<&crate::session::Session>) -> String {
     let Some(session) = session else {
         return String::new();
@@ -358,7 +388,7 @@ fn build_subagent_instructions(session: Option<&crate::session::Session>) -> Str
         .collect();
 
     // If the session is started from a recipe, also use the subrecipes for
-    // that recipe as delegate targets
+    // that recipe as swarm targets
     if let Some(recipe) = session.recipe.as_ref() {
         if let Some(subs) = recipe.sub_recipes.as_ref() {
             let mut seen: std::collections::HashSet<String> =
@@ -398,8 +428,8 @@ fn build_subagent_instructions(session: Option<&crate::session::Session>) -> Str
     let mut out = String::new();
     out.push_str(
         "\n\nThe following named subagents are available in this session and \
-         can be invoked through the `delegate` tool (run as a subagent) or \
-         the `load` tool (read their instructions into your own context):\n",
+         can be invoked through the `swarm_execute` tool (run as a subagent) \
+         or the `load` tool (read their instructions into your own context):\n",
     );
 
     let mut current_kind: Option<SourceType> = None;
@@ -422,12 +452,12 @@ fn build_subagent_instructions(session: Option<&crate::session::Session>) -> Str
          context whether they want it invoked, and if so, call it.\n\
          • The user's request strongly matches a subagent's description — \
          call it.\n\n\
-         Calling a subagent normally means `delegate(source: \"<name>\", \
-         instructions: ...)`, which runs it as an isolated subagent and \
-         returns its result. Use `load(source: \"<name>\")` instead if you \
-         only want to read the subagent's instructions into your own \
-         context. For long-running work, pass `async: true` to `delegate` — \
-         it returns a task id immediately, and you collect the result later \
+         Calling a subagent normally means `swarm_execute(source: \"<name>\", \
+         task: ...)`, which runs it as an isolated subagent and returns its \
+         result. Use `load(source: \"<name>\")` instead if you only want to \
+         read the subagent's instructions into your own context. For \
+         long-running work, pass `async: true` to `swarm_execute` — it \
+         returns a task id immediately, and you collect the result later \
          with `load(source: \"<task_id>\")`, which waits for completion.",
     ));
 
@@ -565,80 +595,6 @@ impl SummonClient {
         )
     }
 
-    fn create_delegate_tool(&self) -> Tool {
-        let schema = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "instructions": {
-                    "type": "string",
-                    "description": "Task instructions. Required for ad-hoc tasks."
-                },
-                "source": {
-                    "type": "string",
-                    "description": "Name of a recipe or agent to run."
-                },
-                "parameters": {
-                    "type": "object",
-                    "additionalProperties": true,
-                    "description": "Parameters for the source (only valid with source)."
-                },
-                "extensions": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Extensions to enable. Omit to inherit all, empty array for none."
-                },
-                "provider": {
-                    "type": "string",
-                    "description": "Override LLM provider."
-                },
-                "model": {
-                    "type": "string",
-                    "description": "Override model."
-                },
-                "temperature": {
-                    "type": "number",
-                    "description": "Override temperature."
-                },
-                "max_turns": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "description": "Maximum turns for this delegate. Overrides recipe settings.max_turns and GOOSE_SUBAGENT_MAX_TURNS."
-                },
-                "context": {
-                    "type": "string",
-                    "description": "Reference context to inject into the delegate's system prompt. Use for background information, file contents, or constraints the delegate needs but that aren't part of the task instructions."
-                },
-                "working_dir": {
-                    "type": "string",
-                    "description": "Working directory for the delegate. Must be within the parent session's working directory. Defaults to the parent's working directory."
-                },
-                "async": {
-                    "type": "boolean",
-                    "default": false,
-                    "description": "Run in background (default: false)."
-                }
-            }
-        });
-
-        Tool::new(
-            "delegate",
-            "Delegate a task to a subagent that runs independently with its own context.\n\n\
-             Modes:\n\
-             1. Ad-hoc: Provide `instructions` for a custom task\n\
-             2. Source-based: Provide `source` name to run a subrecipe, recipe, or agent\n\
-             3. Combined: Pair a source with a task (e.g., source: \"deploy\", instructions: \"deploy to staging\")\n\n\
-             Effective Delegation:\n\
-             - Delegates know only instructions + source content\n\
-             - Delegates cannot coordinate. Same-file work = conflicts.\n\
-             - Parallel: async: true, then load(taskId) to wait and get results. Single: sync.\n\n\
-             Research (read-only): parallelize freely - delegates explore and report back.\n\
-             Work (writes): partition files strictly - no two delegates touch the same file.\n\n\
-             Decompose → async delegates → load(taskId) for each → synthesize."
-                .to_string(),
-            schema.as_object().unwrap().clone(),
-        )
-    }
-
     fn create_swarm_tool(&self) -> Tool {
         let schema = serde_json::json!({
             "type": "object",
@@ -647,6 +603,64 @@ impl SummonClient {
                 "task": {
                     "type": "string",
                     "description": "The complex task to run as a swarm. Pass the full task verbatim, including any lists, constraints, and reference material — the decomposer only sees this text."
+                },
+                "subtasks": {
+                    "type": "array",
+                    "description": "Explicit subtask plan. When provided, the planning LLM call is skipped and this plan is validated and executed as-is. A single entry runs one subagent directly (no planning overhead).",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "instruction": {
+                                "type": "string",
+                                "description": "Self-contained directive for one worker agent. Required unless 'source' is set. Workers are isolated: they see only their own instruction, content, and the outputs of subtasks they depend on."
+                            },
+                            "source": {
+                                "type": "string",
+                                "description": "Name of a subrecipe, recipe, or agent to run as this subtask. Combine with 'instruction' to give it a specific task."
+                            },
+                            "parameters": {
+                                "type": "object",
+                                "additionalProperties": true,
+                                "description": "Template parameters for this subtask's 'source'."
+                            },
+                            "content": {
+                                "type": "string",
+                                "description": "Verbatim reference material this subtask needs."
+                            },
+                            "role": {
+                                "type": "string",
+                                "description": "Short role label like researcher, coder, reviewer, synthesizer."
+                            },
+                            "depends_on": {
+                                "type": "array",
+                                "items": {"type": "integer"},
+                                "description": "Zero-based indices of prerequisite subtasks whose outputs this one needs."
+                            },
+                            "output_schema": {
+                                "type": "object",
+                                "description": "Optional JSON Schema for this subtask's result when downstream steps need machine-readable data."
+                            },
+                            "workspace_writes": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Relative repo paths this subtask will create or modify. Two subtasks must never declare the same path."
+                            },
+                            "required_extensions": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Extension names this subtask needs; omit to inherit all."
+                            }
+                        }
+                    }
+                },
+                "source": {
+                    "type": "string",
+                    "description": "Name of a subrecipe, recipe, or agent to run as a single-subtask swarm; 'task' becomes its work instructions. For multi-node plans, use the per-subtask 'source' field inside 'subtasks' instead."
+                },
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "description": "Template parameters for the top-level 'source' (only valid with 'source')."
                 },
                 "provider": {
                     "type": "string",
@@ -675,20 +689,38 @@ impl SummonClient {
                     "type": "integer",
                     "minimum": 1,
                     "description": "How many independent subtasks may run at once (default: GOOSE_MAX_BACKGROUND_TASKS, 5). Use 1 to force sequential dispatch."
+                },
+                "async": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Run the swarm in the background. Returns a task id immediately; load(source: \"<task_id>\") waits for the report, peek: true checks progress, cancel: true stops the run."
                 }
             }
         });
 
         Tool::new(
             "swarm_execute",
-            "Run a complex task as an orchestrated swarm of subagents.\n\n\
-             The task is semantically decomposed into a dependency graph of subtasks, a \
-             topology (pipeline, fan-out-join, or general DAG) is selected from that graph, \
-             and each subtask runs as an independent subagent. Outputs pass between subtasks \
-             through a shared scratch pad — each dependent receives exactly its prerequisites' \
-             outputs — and the final sink output(s) are returned here.\n\n\
-             Use this instead of manual delegate/load loops when a task has multiple distinct \
-             parts or ordered phases. Use plain `delegate` for a single self-contained task."
+            "Run a task as an orchestrated swarm of subagents — from a single delegated \
+             worker to a full dependency graph.\n\n\
+             Planning modes:\n\
+             1. `task` alone: the task is semantically decomposed into a dependency graph of \
+             subtasks, a topology (pipeline, fan-out-join, or general DAG) is selected, and \
+             each subtask runs as an independent subagent.\n\
+             2. `subtasks`: supply the plan yourself — no planning LLM call. A single entry \
+             runs one subagent directly (the replacement for a plain delegated task).\n\
+             3. `source`: run a named subrecipe, recipe, or agent as a single-subtask swarm; \
+             `task` becomes its work instructions.\n\n\
+             Outputs pass between subtasks through a shared scratch pad — each dependent \
+             receives exactly its prerequisites' outputs — and the final sink output(s) are \
+             returned here.\n\n\
+             Effective use:\n\
+             - Workers are isolated: each sees only its own instruction, content, and its \
+             prerequisites' outputs. Make every instruction self-contained.\n\
+             - Workers cannot coordinate beyond declared dependencies. Same-file work = \
+             conflicts: partition files via workspace_writes; never two subtasks on one file.\n\
+             - Research (read-only) parallelizes freely; write work must be partitioned.\n\
+             - For long-running work pass `async: true`, keep working, and collect the report \
+             with load(source: \"<task_id>\")."
                 .to_string(),
             schema.as_object().unwrap().clone(),
         )
@@ -700,6 +732,8 @@ impl SummonClient {
         arguments: Option<JsonObject>,
         cancellation_token: CancellationToken,
     ) -> Result<CallToolResult, String> {
+        self.cleanup_completed_tasks().await;
+
         let params: SwarmExecuteParams = arguments
             .map(|args| serde_json::from_value(serde_json::Value::Object(args)))
             .transpose()
@@ -708,6 +742,18 @@ impl SummonClient {
 
         if params.task.trim().is_empty() {
             return Err("'task' must be a non-empty string".to_string());
+        }
+        if params.source.is_some() && params.subtasks.is_some() {
+            return Err(
+                "'source' and 'subtasks' cannot be combined; use the per-subtask 'source' \
+                 field inside 'subtasks' instead"
+                    .to_string(),
+            );
+        }
+        if params.parameters.is_some() && params.source.is_none() {
+            return Err(
+                "top-level 'parameters' can only be used with a top-level 'source'".to_string(),
+            );
         }
         if let Some(max) = params.max_turns {
             if max < 1 {
@@ -731,26 +777,86 @@ impl SummonClient {
             return Err("Delegated tasks cannot spawn swarms".to_string());
         }
 
-        let delegate_params = DelegateParams {
+        if params.r#async {
+            let (content, task_id) = self.handle_async_swarm(&params, &session).await?;
+            let mut meta = Meta::new();
+            meta.0.insert(
+                "subagent_session_id".to_string(),
+                serde_json::Value::String(task_id),
+            );
+            return Ok(CallToolResult::success(content).with_meta(Some(meta)));
+        }
+
+        let (mut kernel, decomposer) = self
+            .prepare_swarm(
+                &params,
+                &session,
+                cancellation_token,
+                Arc::new(Mutex::new(Vec::new())),
+                None,
+            )
+            .await?;
+        let report = kernel
+            .run(&params.task, decomposer.as_ref())
+            .await
+            .map_err(|e| format!("Swarm execution failed: {}", e))?;
+
+        Ok(CallToolResult::success(vec![Content::text(
+            render_swarm_report(&report),
+        )]))
+    }
+
+    /// Build everything a swarm run needs — task config, plan source, workspace,
+    /// notification bridge, spawner — shared by the sync and background paths.
+    async fn prepare_swarm(
+        &self,
+        params: &SwarmExecuteParams,
+        session: &crate::session::Session,
+        cancellation_token: CancellationToken,
+        notification_buffer: Arc<Mutex<Vec<ServerNotification>>>,
+        on_message: Option<OnMessageCallback>,
+    ) -> Result<(Kernel, Box<dyn Decomposer>), String> {
+        let subagent_params = SubagentParams {
             instructions: Some(params.task.clone()),
             provider: params.provider.clone(),
             model: params.model.clone(),
             max_turns: params.max_turns,
             ..Default::default()
         };
-        let recipe = self.build_adhoc_recipe(&delegate_params)?;
+        let recipe = self.build_adhoc_recipe(&subagent_params)?;
         let task_config = self
-            .build_task_config(&delegate_params, &recipe, &session)
+            .build_task_config(&subagent_params, &recipe, session)
             .await
             .map_err(|e| format!("Failed to build task config: {}", e))?;
 
         let available_extensions: Vec<String> =
             task_config.extensions.iter().map(|e| e.name()).collect();
-        let decomposer = SemanticDecomposer::new(
-            task_config.provider.clone(),
-            task_config.model_config.clone(),
-        )
-        .with_available_extensions(available_extensions);
+        let explicit_plan = if let Some(source_name) = &params.source {
+            let mut st = SubTask::new("subtask-1", params.task.clone());
+            st.source = Some(source_name.clone());
+            st.parameters = params.parameters.clone();
+            Some(vec![st])
+        } else {
+            params
+                .subtasks
+                .as_ref()
+                .map(|value| parse_explicit_subtasks(value, &available_extensions))
+                .transpose()?
+        };
+        let source_recipes = match &explicit_plan {
+            Some(plan) => self.resolve_subtask_sources(plan, session).await?,
+            None => HashMap::new(),
+        };
+        let decomposer: Box<dyn Decomposer> = match explicit_plan {
+            Some(plan) => Box::new(FixedPlan(plan)),
+            None => Box::new(
+                SemanticDecomposer::new(
+                    task_config.provider.clone(),
+                    task_config.model_config.clone(),
+                )
+                .with_available_extensions(available_extensions),
+            ),
+        };
 
         let workspace_root = session
             .working_dir
@@ -763,7 +869,7 @@ impl SummonClient {
         Self::spawn_notification_bridge(
             notif_rx,
             Arc::clone(&self.notification_subscribers),
-            Arc::new(Mutex::new(Vec::new())),
+            notification_buffer,
         );
 
         let spawner = Arc::new(SummonAgentSpawner {
@@ -773,6 +879,8 @@ impl SummonClient {
             cancellation_token,
             notification_tx: notif_tx,
             workspace_root,
+            on_message,
+            source_recipes,
         });
 
         let mut kernel = Kernel::new(spawner).with_max_concurrency(
@@ -786,14 +894,106 @@ impl SummonClient {
         if let Some(secs) = params.max_duration_secs {
             kernel = kernel.with_max_run_duration(Duration::from_secs(secs));
         }
-        let report = kernel
-            .run(&params.task, &decomposer)
-            .await
-            .map_err(|e| format!("Swarm execution failed: {}", e))?;
+        Ok((kernel, decomposer))
+    }
 
-        Ok(CallToolResult::success(vec![Content::text(
-            render_swarm_report(&report),
-        )]))
+    /// Resolve every subtask's named source to a concrete recipe before any
+    /// dispatch, so an unknown name fails the whole run up front instead of
+    /// mid-graph. Instructions are NOT folded in here — the spawner appends the
+    /// subtask's instruction and dependency context to the recipe prompt.
+    async fn resolve_subtask_sources(
+        &self,
+        subtasks: &[SubTask],
+        session: &crate::session::Session,
+    ) -> Result<HashMap<String, Recipe>, String> {
+        let mut recipes = HashMap::new();
+        for st in subtasks {
+            if let Some(source_name) = &st.source {
+                let subagent_params = SubagentParams {
+                    parameters: st.parameters.clone(),
+                    ..Default::default()
+                };
+                let recipe = self
+                    .build_source_recipe(
+                        source_name,
+                        &subagent_params,
+                        &session.id,
+                        &session.working_dir,
+                    )
+                    .await?;
+                recipes.insert(st.id.clone(), recipe);
+            }
+        }
+        Ok(recipes)
+    }
+
+    async fn handle_async_swarm(
+        &self,
+        params: &SwarmExecuteParams,
+        session: &crate::session::Session,
+    ) -> Result<(Vec<Content>, String), String> {
+        let task_count = self.background_tasks.lock().await.len();
+        let max_tasks = max_background_tasks();
+        if task_count >= max_tasks {
+            return Err(format!(
+                "Maximum {} background tasks already running. Wait for completion or use sync mode.",
+                max_tasks
+            ));
+        }
+
+        let turns = Arc::new(AtomicU32::new(0));
+        let last_activity = Arc::new(AtomicU64::new(current_epoch_millis()));
+        let turns_clone = Arc::clone(&turns);
+        let last_activity_clone = Arc::clone(&last_activity);
+        let on_message: OnMessageCallback = Arc::new(move |_msg| {
+            turns_clone.fetch_add(1, Ordering::Relaxed);
+            last_activity_clone.store(current_epoch_millis(), Ordering::Relaxed);
+        });
+
+        let task_token = CancellationToken::new();
+        let notification_buffer = Arc::new(Mutex::new(Vec::new()));
+
+        let (mut kernel, decomposer) = self
+            .prepare_swarm(
+                params,
+                session,
+                task_token.clone(),
+                Arc::clone(&notification_buffer),
+                Some(on_message),
+            )
+            .await?;
+
+        static SWARM_TASK_SEQ: AtomicU64 = AtomicU64::new(1);
+        let task_id = format!("swarm-{}", SWARM_TASK_SEQ.fetch_add(1, Ordering::Relaxed));
+        let description = safe_truncate(&format!("swarm: {}", params.task), TASK_LABEL_BUDGET);
+
+        let task_text = params.task.clone();
+        let handle = tokio::spawn(async move {
+            let report = kernel.run(&task_text, decomposer.as_ref()).await?;
+            Ok(render_swarm_report(&report))
+        });
+
+        let task = BackgroundTask {
+            id: task_id.clone(),
+            description: description.clone(),
+            started_at: Instant::now(),
+            turns,
+            last_activity,
+            handle,
+            cancellation_token: task_token,
+            notification_buffer,
+        };
+        self.background_tasks
+            .lock()
+            .await
+            .insert(task_id.clone(), task);
+
+        let content = vec![Content::text(format!(
+            "Swarm task {} started in background: \"{}\"\n\
+             Continue with other work. When you need the report, use load(source: \"{}\").",
+            task_id, description, task_id
+        ))];
+        Ok((content, task_id))
     }
 
     async fn get_working_dir(&self, session_id: &str) -> PathBuf {
@@ -1017,7 +1217,12 @@ impl SummonClient {
 
         let name = source_name.unwrap();
 
-        if is_session_id(name) {
+        // Swarm task ids ("swarm-N") don't look like session ids, so also route
+        // by registry membership.
+        let is_registered_task = self.background_tasks.lock().await.contains_key(name)
+            || self.completed_tasks.lock().await.contains_key(name);
+
+        if is_session_id(name) || is_registered_task {
             let task_result = self.handle_load_task_result(name, cancel, peek).await?;
             let mut meta = Meta::new();
             meta.0.insert(
@@ -1274,7 +1479,7 @@ impl SummonClient {
 
         if sources.is_empty() && completed.is_empty() {
             return Ok(vec![Content::text(
-                "No sources available for load/delegate.\n\n\
+                "No sources available for load/swarm_execute.\n\n\
                  Sources are discovered from:\n\
                  • Current recipe's sub_recipes\n\
                  • .agents/recipes/, .agents/agents/ (project-level)\n\
@@ -1283,7 +1488,7 @@ impl SummonClient {
             )]);
         }
 
-        let mut output = String::from("Available sources for load/delegate:\n");
+        let mut output = String::from("Available sources for load/swarm_execute:\n");
 
         if !completed.is_empty() {
             output.push_str("\nCompleted Tasks (awaiting retrieval):\n");
@@ -1317,7 +1522,7 @@ impl SummonClient {
         }
 
         output.push_str("\nUse load(source: \"name\") to load into context.\n");
-        output.push_str("Use delegate(source: \"name\") to run as subagent.");
+        output.push_str("Use swarm_execute(source: \"name\", task: \"...\") to run as subagent.");
 
         Ok(vec![Content::text(output)])
     }
@@ -1372,157 +1577,7 @@ impl SummonClient {
         }
     }
 
-    async fn handle_delegate(
-        &self,
-        session_id: &str,
-        arguments: Option<JsonObject>,
-        cancellation_token: CancellationToken,
-    ) -> Result<CallToolResult, String> {
-        self.cleanup_completed_tasks().await;
-
-        let params: DelegateParams = arguments
-            .map(|args| serde_json::from_value(serde_json::Value::Object(args)))
-            .transpose()
-            .map_err(|e| format!("Invalid parameters: {}", e))?
-            .unwrap_or_default();
-
-        self.validate_delegate_params(&params)?;
-
-        let session = self
-            .context
-            .session_manager
-            .get_session(session_id, false)
-            .await
-            .map_err(|e| format!("Failed to get session: {}", e))?;
-
-        if session.session_type == SessionType::SubAgent {
-            return Err("Delegated tasks cannot spawn further delegations".to_string());
-        }
-
-        if params.r#async {
-            let (content, task_id) = self.handle_async_delegate(session_id, params).await?;
-            let mut meta = Meta::new();
-            meta.0.insert(
-                "subagent_session_id".to_string(),
-                serde_json::Value::String(task_id),
-            );
-            return Ok(CallToolResult::success(content).with_meta(Some(meta)));
-        }
-
-        let working_dir = session.working_dir.clone();
-        let recipe = self
-            .build_delegate_recipe(&params, session_id, &working_dir)
-            .await?;
-
-        let task_config = self
-            .build_task_config(&params, &recipe, &session)
-            .await
-            .map_err(|e| format!("Failed to build task config: {}", e))?;
-
-        // Subagents must use Auto until get_agent_messages forwards
-        // ActionRequired messages to the parent. Until then, any mode
-        // that requires approval will hang on the subagent's confirmation_rx.
-        let agent_config = AgentConfig::new(
-            self.context.session_manager.clone(),
-            crate::config::permission::PermissionManager::instance(),
-            None,
-            GooseMode::Auto,
-            true, // disable session naming for subagents
-            crate::agents::GoosePlatform::GooseCli,
-        )
-        .with_use_login_shell_path(self.context.use_login_shell_path);
-
-        let subagent_session = self
-            .context
-            .session_manager
-            .create_session(
-                task_config.parent_working_dir.clone(),
-                "Delegated task".to_string(),
-                SessionType::SubAgent,
-                GooseMode::Auto,
-            )
-            .await
-            .map_err(|e| format!("Failed to create subagent session: {}", e))?;
-
-        let (notif_tx, notif_rx) = tokio::sync::mpsc::unbounded_channel::<ServerNotification>();
-        Self::spawn_notification_bridge(
-            notif_rx,
-            Arc::clone(&self.notification_subscribers),
-            Arc::new(Mutex::new(Vec::new())),
-        );
-
-        let subagent_session_id = subagent_session.id.clone();
-
-        let result = run_subagent_task(SubagentRunParams {
-            config: agent_config,
-            recipe,
-            task_config,
-            return_last_only: true,
-            session_id: subagent_session.id,
-            cancellation_token: Some(cancellation_token),
-            on_message: None,
-            notification_tx: Some(notif_tx),
-        })
-        .await;
-
-        let mut meta = Meta::new();
-        meta.0.insert(
-            "subagent_session_id".to_string(),
-            serde_json::Value::String(subagent_session_id),
-        );
-
-        match result {
-            Ok(text) => {
-                Ok(CallToolResult::success(vec![Content::text(text)]).with_meta(Some(meta)))
-            }
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "Delegation failed: {}",
-                e
-            ))])
-            .with_meta(Some(meta))),
-        }
-    }
-
-    fn validate_delegate_params(&self, params: &DelegateParams) -> Result<(), String> {
-        if params.instructions.is_none() && params.source.is_none() {
-            return Err("Must provide 'instructions' or 'source' (or both)".to_string());
-        }
-
-        if params.parameters.is_some() && params.source.is_none() {
-            return Err("'parameters' can only be used with 'source'".to_string());
-        }
-
-        if let Some(max) = params.max_turns {
-            if max < 1 {
-                return Err("'max_turns' must be at least 1".to_string());
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn build_delegate_recipe(
-        &self,
-        params: &DelegateParams,
-        session_id: &str,
-        working_dir: &Path,
-    ) -> Result<Recipe, String> {
-        let mut recipe = if let Some(source_name) = &params.source {
-            self.build_source_recipe(source_name, params, session_id, working_dir)
-                .await?
-        } else {
-            self.build_adhoc_recipe(params)?
-        };
-
-        if let Some(ref context) = params.context {
-            let existing = recipe.instructions.unwrap_or_default();
-            recipe.instructions = Some(build_instructions_with_context(context, &existing));
-        }
-
-        Ok(recipe)
-    }
-
-    fn build_adhoc_recipe(&self, params: &DelegateParams) -> Result<Recipe, String> {
+    fn build_adhoc_recipe(&self, params: &SubagentParams) -> Result<Recipe, String> {
         let task = params
             .instructions
             .as_ref()
@@ -1540,7 +1595,7 @@ impl SummonClient {
     async fn build_source_recipe(
         &self,
         source_name: &str,
-        params: &DelegateParams,
+        params: &SubagentParams,
         session_id: &str,
         working_dir: &Path,
     ) -> Result<Recipe, String> {
@@ -1578,18 +1633,23 @@ impl SummonClient {
     async fn build_recipe_from_source(
         &self,
         source: &SourceEntry,
-        params: &DelegateParams,
+        params: &SubagentParams,
         session_id: &str,
     ) -> Result<Recipe, String> {
-        let session = self
-            .context
-            .session_manager
-            .get_session(session_id, false)
-            .await
-            .map_err(|e| format!("Failed to get session: {}", e))?;
-
         if source.source_type == SourceType::Subrecipe {
-            let sub_recipes = session.recipe.as_ref().and_then(|r| r.sub_recipes.as_ref());
+            // Session-declared subrecipes carry preset values to merge; the
+            // session is only needed here, so filesystem recipes and agents
+            // stay resolvable without one.
+            let session = self
+                .context
+                .session_manager
+                .get_session(session_id, false)
+                .await
+                .ok();
+            let sub_recipes = session
+                .as_ref()
+                .and_then(|s| s.recipe.as_ref())
+                .and_then(|r| r.sub_recipes.as_ref());
 
             if let Some(sub_recipes) = sub_recipes {
                 if let Some(sr) = sub_recipes.iter().find(|sr| sr.name == source.name) {
@@ -1656,7 +1716,7 @@ impl SummonClient {
     fn build_recipe_from_agent(
         &self,
         source: &SourceEntry,
-        params: &DelegateParams,
+        params: &SubagentParams,
     ) -> Result<Recipe, String> {
         let agent_content = if source.path.is_empty() {
             return Err("Agent source has no path".to_string());
@@ -1702,7 +1762,7 @@ impl SummonClient {
 
     async fn build_task_config(
         &self,
-        params: &DelegateParams,
+        params: &SubagentParams,
         recipe: &Recipe,
         session: &crate::session::Session,
     ) -> Result<TaskConfig, anyhow::Error> {
@@ -1766,7 +1826,7 @@ impl SummonClient {
 
     fn resolve_model_config(
         &self,
-        params: &DelegateParams,
+        params: &SubagentParams,
         recipe: &Recipe,
         session: &crate::session::Session,
         provider_name: &str,
@@ -1819,7 +1879,7 @@ impl SummonClient {
 
     async fn resolve_provider(
         &self,
-        params: &DelegateParams,
+        params: &SubagentParams,
         recipe: &Recipe,
         session: &crate::session::Session,
     ) -> Result<
@@ -1920,136 +1980,6 @@ impl SummonClient {
         let ttl = completed_task_ttl();
         completed.retain(|_id, task| task.completed_at.elapsed() <= ttl);
     }
-
-    fn get_task_description(params: &DelegateParams) -> String {
-        match (&params.source, &params.instructions) {
-            (Some(source), Some(instructions)) => format!("{}: {}", source, instructions),
-            (Some(source), None) => source.clone(),
-            (None, Some(instructions)) => instructions.clone(),
-            (None, None) => "Unknown task".to_string(),
-        }
-    }
-
-    async fn handle_async_delegate(
-        &self,
-        session_id: &str,
-        params: DelegateParams,
-    ) -> Result<(Vec<Content>, String), String> {
-        let task_count = self.background_tasks.lock().await.len();
-        let max_tasks = max_background_tasks();
-        if task_count >= max_tasks {
-            return Err(format!(
-                "Maximum {} background tasks already running. Wait for completion or use sync mode.",
-                max_tasks
-            ));
-        }
-
-        let session = self
-            .context
-            .session_manager
-            .get_session(session_id, false)
-            .await
-            .map_err(|e| format!("Failed to get session: {}", e))?;
-
-        let working_dir = session.working_dir.clone();
-        let recipe = self
-            .build_delegate_recipe(&params, session_id, &working_dir)
-            .await?;
-
-        let task_config = self
-            .build_task_config(&params, &recipe, &session)
-            .await
-            .map_err(|e| format!("Failed to build task config: {}", e))?;
-
-        let description = safe_truncate(&Self::get_task_description(&params), TASK_LABEL_BUDGET);
-
-        // Subagents must use Auto until get_agent_messages forwards
-        // ActionRequired messages to the parent. Until then, any mode
-        // that requires approval will hang on the subagent's confirmation_rx.
-        let agent_config = AgentConfig::new(
-            self.context.session_manager.clone(),
-            crate::config::permission::PermissionManager::instance(),
-            None,
-            GooseMode::Auto,
-            true, // disable session naming for subagents
-            crate::agents::GoosePlatform::GooseCli,
-        )
-        .with_use_login_shell_path(self.context.use_login_shell_path);
-
-        let subagent_session = self
-            .context
-            .session_manager
-            .create_session(
-                task_config.parent_working_dir.clone(),
-                description.clone(),
-                SessionType::SubAgent,
-                GooseMode::Auto,
-            )
-            .await
-            .map_err(|e| format!("Failed to create subagent session: {}", e))?;
-
-        let task_id = subagent_session.id.clone();
-
-        let turns = Arc::new(AtomicU32::new(0));
-        let last_activity = Arc::new(AtomicU64::new(current_epoch_millis()));
-
-        let turns_clone = Arc::clone(&turns);
-        let last_activity_clone = Arc::clone(&last_activity);
-
-        let on_message: OnMessageCallback = Arc::new(move |_msg| {
-            turns_clone.fetch_add(1, Ordering::Relaxed);
-            last_activity_clone.store(current_epoch_millis(), Ordering::Relaxed);
-        });
-
-        let task_token = CancellationToken::new();
-        let task_token_clone = task_token.clone();
-
-        let notification_buffer = Arc::new(Mutex::new(Vec::new()));
-
-        let (notif_tx, notif_rx) = tokio::sync::mpsc::unbounded_channel::<ServerNotification>();
-        Self::spawn_notification_bridge(
-            notif_rx,
-            Arc::clone(&self.notification_subscribers),
-            Arc::clone(&notification_buffer),
-        );
-
-        let handle = tokio::spawn(async move {
-            run_subagent_task(SubagentRunParams {
-                config: agent_config,
-                recipe,
-                task_config,
-                return_last_only: true,
-                session_id: subagent_session.id,
-                cancellation_token: Some(task_token_clone),
-                on_message: Some(on_message),
-                notification_tx: Some(notif_tx),
-            })
-            .await
-        });
-
-        let task = BackgroundTask {
-            id: task_id.clone(),
-            description: description.clone(),
-            started_at: Instant::now(),
-            turns,
-            last_activity,
-            handle,
-            cancellation_token: task_token,
-            notification_buffer,
-        };
-
-        self.background_tasks
-            .lock()
-            .await
-            .insert(task_id.clone(), task);
-
-        let content = vec![Content::text(format!(
-            "Task {} started in background: \"{}\"\n\
-             Continue with other work. When you need the result, use load(source: \"{}\").",
-            task_id, description, task_id
-        ))];
-        Ok((content, task_id))
-    }
 }
 
 /// [`AgentSpawner`] backed by Goose's real subagent machinery: each subtask runs
@@ -2062,6 +1992,12 @@ struct SummonAgentSpawner {
     cancellation_token: CancellationToken,
     notification_tx: tokio::sync::mpsc::UnboundedSender<ServerNotification>,
     workspace_root: PathBuf,
+    /// Progress callback shared across all subtasks; background runs use it to
+    /// track aggregate turn count and last-activity time for peek.
+    on_message: Option<OnMessageCallback>,
+    /// Pre-resolved recipes for subtasks that run a named source, keyed by
+    /// subtask id. Subtasks not in this map run as ad-hoc workers.
+    source_recipes: HashMap<String, Recipe>,
 }
 
 impl SummonAgentSpawner {
@@ -2150,14 +2086,29 @@ impl AgentSpawner for SummonAgentSpawner {
             ));
         }
 
-        let mut recipe = Recipe::builder()
-            .version("1.0.0")
-            .title(format!("Swarm subtask {}", subtask.id))
-            .description(format!("Swarm {} subtask", agent.role))
-            .instructions(&agent.system_prompt)
-            .prompt(&prompt)
-            .build()
-            .map_err(|e| anyhow::anyhow!("Failed to build swarm subtask recipe: {}", e))?;
+        let mut recipe = match self.source_recipes.get(&subtask.id) {
+            Some(base) => {
+                // The source recipe keeps its own instructions/settings; the
+                // swarm-specific material (subtask instruction, dependency
+                // context, artifact guidance) extends its prompt.
+                let mut recipe = base.clone();
+                let mut base_prompt = recipe.prompt.take().unwrap_or_default();
+                if !base_prompt.is_empty() {
+                    base_prompt.push_str("\n\n");
+                }
+                base_prompt.push_str(&prompt);
+                recipe.prompt = Some(base_prompt);
+                recipe
+            }
+            None => Recipe::builder()
+                .version("1.0.0")
+                .title(format!("Swarm subtask {}", subtask.id))
+                .description(format!("Swarm {} subtask", agent.role))
+                .instructions(&agent.system_prompt)
+                .prompt(&prompt)
+                .build()
+                .map_err(|e| anyhow::anyhow!("Failed to build swarm subtask recipe: {}", e))?,
+        };
         recipe.response = Some(Response {
             json_schema: Some(envelope_schema_for(subtask.output_schema.as_ref())),
         });
@@ -2193,7 +2144,7 @@ impl AgentSpawner for SummonAgentSpawner {
             return_last_only: true,
             session_id: subagent_session.id,
             cancellation_token: Some(self.cancellation_token.child_token()),
-            on_message: None,
+            on_message: self.on_message.clone(),
             notification_tx: Some(self.notification_tx.clone()),
         })
         .await?;
@@ -2286,7 +2237,6 @@ impl McpClientTrait for SummonClient {
         let mut tools = vec![self.create_load_tool()];
 
         if !is_subagent {
-            tools.push(self.create_delegate_tool());
             tools.push(self.create_swarm_tool());
         }
 
@@ -2313,18 +2263,6 @@ impl McpClientTrait for SummonClient {
                     error
                 ))])),
             },
-            "delegate" => {
-                match self
-                    .handle_delegate(session_id, arguments, cancellation_token)
-                    .await
-                {
-                    Ok(result) => Ok(result),
-                    Err(error) => Ok(CallToolResult::error(vec![Content::text(format!(
-                        "Error: {}",
-                        error
-                    ))])),
-                }
-            }
             "swarm_execute" => {
                 match self
                     .handle_swarm_execute(session_id, arguments, cancellation_token)
@@ -2761,7 +2699,11 @@ You review code."#;
             .await
             .unwrap();
         let names: Vec<_> = result.tools.iter().map(|t| t.name.as_ref()).collect();
-        assert!(names.contains(&"load") && names.contains(&"delegate"));
+        assert!(names.contains(&"load") && names.contains(&"swarm_execute"));
+        assert!(
+            !names.contains(&"delegate"),
+            "the delegate tool surface is retired"
+        );
 
         let ctx = ToolCallContext::new("test".to_string(), None, None);
         let result = client
@@ -2780,94 +2722,6 @@ You review code."#;
         assert_eq!(round_duration(Duration::from_secs(60)), "1m");
         assert_eq!(round_duration(Duration::from_secs(90)), "1m");
         assert_eq!(round_duration(Duration::from_secs(120)), "2m");
-    }
-
-    #[test]
-    fn test_task_description_formatting() {
-        let make_params = |source: Option<&str>, instructions: Option<&str>| DelegateParams {
-            source: source.map(String::from),
-            instructions: instructions.map(String::from),
-            ..Default::default()
-        };
-
-        assert_eq!(
-            SummonClient::get_task_description(&make_params(Some("recipe"), None)),
-            "recipe"
-        );
-        assert_eq!(
-            SummonClient::get_task_description(&make_params(None, Some("do stuff"))),
-            "do stuff"
-        );
-        assert_eq!(
-            SummonClient::get_task_description(&make_params(Some("r"), Some("task"))),
-            "r: task"
-        );
-        assert_eq!(
-            SummonClient::get_task_description(&make_params(None, None)),
-            "Unknown task"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_context_injected_into_adhoc_recipe() {
-        let temp_dir = TempDir::new().unwrap();
-        let client = SummonClient::new(create_test_context()).unwrap();
-
-        let params = DelegateParams {
-            instructions: Some("do the task".to_string()),
-            context: Some("background info".to_string()),
-            ..Default::default()
-        };
-
-        let recipe = client
-            .build_delegate_recipe(&params, "test", temp_dir.path())
-            .await
-            .unwrap();
-
-        assert_eq!(
-            recipe.instructions.as_deref(),
-            Some("# Reference Context\n\nbackground info")
-        );
-        assert_eq!(recipe.prompt.as_deref(), Some("do the task"));
-    }
-
-    #[test]
-    fn test_build_instructions_with_context_wraps_existing_instructions() {
-        assert_eq!(
-            build_instructions_with_context("background info", "Run deploy steps"),
-            "# Reference Context\n\nbackground info\n\n# Task Instructions\n\nRun deploy steps"
-        );
-        assert_eq!(
-            build_instructions_with_context("background info", ""),
-            "# Reference Context\n\nbackground info"
-        );
-    }
-
-    #[test]
-    fn test_validate_delegate_params_rejects_zero_max_turns() {
-        let context = create_test_context();
-        let client = SummonClient::new(context).unwrap();
-
-        let params = DelegateParams {
-            instructions: Some("do something".to_string()),
-            max_turns: Some(0),
-            ..Default::default()
-        };
-        let result = client.validate_delegate_params(&params);
-        assert_eq!(result, Err("'max_turns' must be at least 1".to_string()));
-    }
-
-    #[test]
-    fn test_validate_delegate_params_accepts_positive_max_turns() {
-        let context = create_test_context();
-        let client = SummonClient::new(context).unwrap();
-
-        let params = DelegateParams {
-            instructions: Some("do something".to_string()),
-            max_turns: Some(5),
-            ..Default::default()
-        };
-        assert!(client.validate_delegate_params(&params).is_ok());
     }
 
     #[test]
@@ -2982,7 +2836,7 @@ You review code."#;
         parent: goose_providers::model::ModelConfig,
     ) -> goose_providers::model::ModelConfig {
         let client = SummonClient::new(create_test_context()).unwrap();
-        let params = DelegateParams {
+        let params = SubagentParams {
             model: model.map(String::from),
             ..Default::default()
         };
@@ -3050,6 +2904,113 @@ You review code."#;
             RawContent::Text(t) => t.text.as_str(),
             _ => panic!("Expected text content"),
         }
+    }
+
+    #[test]
+    fn test_parse_explicit_subtasks_valid_plan() {
+        let value = serde_json::json!([
+            {"instruction": "research the topic", "role": "researcher"},
+            {"instruction": "write the summary", "depends_on": [0]}
+        ]);
+        let plan = parse_explicit_subtasks(&value, &[]).unwrap();
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].id, "subtask-1");
+        assert_eq!(plan[1].dependencies, vec!["subtask-1".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_explicit_subtasks_single_entry_is_valid() {
+        let value = serde_json::json!([{"instruction": "do the one thing"}]);
+        let plan = parse_explicit_subtasks(&value, &[]).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert!(plan[0].dependencies.is_empty());
+    }
+
+    #[test]
+    fn test_parse_explicit_subtasks_source_only_entry() {
+        let value = serde_json::json!([
+            {"source": "deploy", "parameters": {"env": "staging"}},
+            {"instruction": "summarize the deploy output", "depends_on": [0]}
+        ]);
+        let plan = parse_explicit_subtasks(&value, &[]).unwrap();
+        assert_eq!(plan[0].source.as_deref(), Some("deploy"));
+        assert!(plan[0].instruction.contains("deploy"));
+        assert_eq!(
+            plan[0].parameters.as_ref().unwrap().get("env"),
+            Some(&serde_json::json!("staging"))
+        );
+        assert!(plan[1].source.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_subtask_sources() {
+        let temp_dir = TempDir::new().unwrap();
+        let recipes = temp_dir.path().join(".goose/recipes");
+        fs::create_dir_all(&recipes).unwrap();
+        fs::write(
+            recipes.join("deploy.yaml"),
+            "title: Deploy\ndescription: Deploy to production\ninstructions: Run deploy steps",
+        )
+        .unwrap();
+
+        let client = SummonClient::new(create_test_context()).unwrap();
+        let session = crate::session::Session {
+            working_dir: temp_dir.path().to_path_buf(),
+            ..Default::default()
+        };
+
+        let mut with_source = SubTask::new("subtask-1", "deploy to staging");
+        with_source.source = Some("deploy".to_string());
+        let adhoc = SubTask::new("subtask-2", "just prose work");
+
+        let resolved = client
+            .resolve_subtask_sources(&[with_source, adhoc], &session)
+            .await
+            .unwrap();
+        assert_eq!(resolved.len(), 1);
+        let recipe = resolved.get("subtask-1").unwrap();
+        assert_eq!(recipe.instructions.as_deref(), Some("Run deploy steps"));
+
+        let mut unknown = SubTask::new("subtask-1", "x");
+        unknown.source = Some("no-such-source".to_string());
+        let err = client
+            .resolve_subtask_sources(&[unknown], &session)
+            .await
+            .unwrap_err();
+        assert!(err.contains("not found"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_parse_explicit_subtasks_rejects_bad_input() {
+        let not_array = serde_json::json!({"instruction": "x"});
+        assert!(parse_explicit_subtasks(&not_array, &[])
+            .unwrap_err()
+            .contains("JSON array"));
+
+        let empty = serde_json::json!([]);
+        assert!(parse_explicit_subtasks(&empty, &[])
+            .unwrap_err()
+            .contains("must not be empty"));
+
+        let missing_instruction = serde_json::json!([{"role": "coder"}]);
+        assert!(parse_explicit_subtasks(&missing_instruction, &[])
+            .unwrap_err()
+            .contains("not a valid plan"));
+
+        let cyclic = serde_json::json!([
+            {"instruction": "a", "depends_on": [1]},
+            {"instruction": "b", "depends_on": [0]}
+        ]);
+        assert!(parse_explicit_subtasks(&cyclic, &[])
+            .unwrap_err()
+            .contains("not a valid plan"));
+
+        let too_many: Vec<serde_json::Value> = (0..MAX_SUBTASKS + 1)
+            .map(|i| serde_json::json!({"instruction": format!("task {i}")}))
+            .collect();
+        assert!(parse_explicit_subtasks(&serde_json::json!(too_many), &[])
+            .unwrap_err()
+            .contains("at most"));
     }
 
     #[test]
@@ -3210,6 +3171,42 @@ You review code."#;
 
         // All tasks consumed -- moim should be empty
         assert!(client.get_moim("test").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_load_routes_swarm_task_ids_to_task_results() {
+        let client = SummonClient::new(create_test_context()).unwrap();
+
+        {
+            let mut running = client.background_tasks.lock().await;
+            running.insert(
+                "swarm-1".to_string(),
+                BackgroundTask {
+                    id: "swarm-1".to_string(),
+                    description: "swarm: analyze the repo".to_string(),
+                    started_at: Instant::now(),
+                    turns: Arc::new(AtomicU32::new(0)),
+                    last_activity: Arc::new(AtomicU64::new(current_epoch_millis())),
+                    handle: tokio::spawn(async {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        Ok("swarm report text".to_string())
+                    }),
+                    cancellation_token: CancellationToken::new(),
+                    notification_buffer: Arc::new(Mutex::new(Vec::new())),
+                },
+            );
+        }
+
+        let args = serde_json::json!({"source": "swarm-1"})
+            .as_object()
+            .unwrap()
+            .clone();
+        let result = client.handle_load("test", Some(args)).await.unwrap();
+        let text = extract_text(&result.content[0]);
+        assert!(
+            text.contains("swarm report text"),
+            "swarm task id should route to the task result path, got: {text}"
+        );
     }
 
     #[tokio::test]

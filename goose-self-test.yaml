@@ -11,7 +11,7 @@ activities:
   - Analyze code structure and parsing capabilities
   - Test extension discovery and management
   - Test load tool for knowledge injection and discovery
-  - Test delegate tool for task delegation (sync and async)
+  - Test swarm_execute tool for subagent orchestration (sync and async)
   - Test error boundaries including nested delegation prevention
   - Generate comprehensive test report
 
@@ -79,12 +79,12 @@ instructions: |
   - Test extension interactions
   - Verify isolation between extensions
 
-  ### Phase 3: Delegate & Load Testing
-  Test the unified delegation and knowledge-loading tools:
+  ### Phase 3: Swarm & Load Testing
+  Test the unified orchestration and knowledge-loading tools:
   - Load tool for discovery and knowledge injection
-  - Delegate tool for synchronous task delegation
-  - Delegate tool for asynchronous background tasks
-  - Parallel delegate execution
+  - swarm_execute with an explicit single-subtask plan (synchronous delegation)
+  - swarm_execute for asynchronous background runs
+  - Parallel subtask execution inside one swarm
   - Nested delegation prevention (critical security test)
 
   ### Phase 4: Advanced Self-Testing
@@ -171,7 +171,7 @@ prompt: |
   {% endif %}
 
   {% if test_phases == "all" or "delegation" in test_phases %}
-  ## 🤖 PHASE 3: Delegate & Load Testing
+  ## 🤖 PHASE 3: Swarm & Load Testing
 
   ### Load Tool - Discovery Mode
   Call `load()` with no arguments to discover all available sources:
@@ -179,7 +179,7 @@ prompt: |
   load()
   ```
   Document what sources are found (recipes, skills, agents, subrecipes).
-  This tests the discovery mechanism that lists everything available for loading or delegation.
+  This tests the discovery mechanism that lists everything available for loading or swarm execution.
 
   ### Load Tool - Builtin Skill Test
   Test loading the builtin `goose-doc-guide` skill:
@@ -195,70 +195,70 @@ prompt: |
   ```
   Verify the content is injected into context without spawning a subagent.
 
-  ### Basic Delegate Test (Synchronous)
-  Use the `delegate` tool with instructions to create a simple task:
+  ### Basic Swarm Test (Single Subtask, Synchronous)
+  Use `swarm_execute` with an explicit one-entry plan — the deterministic fast path
+  that replaces the old single delegate (no planning LLM call):
   ```
-  delegate(instructions: "Create a file called delegate_test.txt containing 'Hello from delegate' and confirm it exists")
+  swarm_execute(task: "Create a test file", subtasks: [{"instruction": "Create a file called swarm_test.txt containing 'Hello from swarm' and confirm it exists"}])
   ```
-  Verify the delegate completes and returns a summary of its work.
+  Verify the swarm report shows 1 subtask, status ok, and a final output summarizing the work.
 
-  ### Parallel Delegate Test
+  ### Parallel Subtask Test
   {% if parallel_tests == "true" %}
-  **Important**: Synchronous delegates always run in serial, even when called in the same tool call message.
-  Async delegates (`async: true`) run in parallel when called in the same tool call message.
+  **Important**: Independent subtasks inside one swarm run concurrently
+  (bounded by max_concurrent_subtasks, default 5).
 
-  First, test sync delegates (will run sequentially):
-  Make these 3 delegate calls in a single message:
-  1. `delegate(instructions: "Sleep 2 seconds, then create /tmp/sync_parallel_1.txt with timestamp from 'date +%H:%M:%S'")`
-  2. `delegate(instructions: "Sleep 2 seconds, then create /tmp/sync_parallel_2.txt with timestamp from 'date +%H:%M:%S'")`
-  3. `delegate(instructions: "Sleep 2 seconds, then create /tmp/sync_parallel_3.txt with timestamp from 'date +%H:%M:%S'")`
+  Run one swarm with 3 independent subtasks:
+  ```
+  swarm_execute(task: "Write three timestamp files in parallel", subtasks: [
+    {"instruction": "Sleep 2 seconds, then create /tmp/swarm_parallel_1.txt with timestamp from 'date +%H:%M:%S'"},
+    {"instruction": "Sleep 2 seconds, then create /tmp/swarm_parallel_2.txt with timestamp from 'date +%H:%M:%S'"},
+    {"instruction": "Sleep 2 seconds, then create /tmp/swarm_parallel_3.txt with timestamp from 'date +%H:%M:%S'"}
+  ])
+  ```
 
-  After completion, check timestamps: `cat /tmp/sync_parallel_*.txt`
-  **Expected**: Timestamps should be ~6+ seconds apart (sequential execution).
+  After completion, check timestamps: `cat /tmp/swarm_parallel_*.txt`
+  **Expected**: Timestamps within ~5 seconds of each other (concurrent execution).
 
-  Then, test async delegates (will run in parallel):
-  Make these 3 delegate calls in a single message:
-  1. `delegate(instructions: "Sleep 2 seconds, then create /tmp/async_parallel_1.txt with timestamp from 'date +%H:%M:%S'", async: true)`
-  2. `delegate(instructions: "Sleep 2 seconds, then create /tmp/async_parallel_2.txt with timestamp from 'date +%H:%M:%S'", async: true)`
-  3. `delegate(instructions: "Sleep 2 seconds, then create /tmp/async_parallel_3.txt with timestamp from 'date +%H:%M:%S'", async: true)`
+  Then force sequential execution with `max_concurrent_subtasks: 1` on the same
+  plan (different filenames, /tmp/swarm_serial_N.txt) and verify timestamps are
+  ~2+ seconds apart in dispatch order.
 
-  Wait for tasks to complete (sleep 10 seconds), then check timestamps: `cat /tmp/async_parallel_*.txt`
-  **Expected**: Timestamps should be within ~5 seconds of each other (parallel execution).
-
-  Document both results to validate the parallel execution behavior.
+  Document both results to validate the concurrency behavior.
   {% endif %}
 
-  ### Async Delegate Test (Background Execution)
-  This tests background task execution with MOIM status monitoring.
+  ### Async Swarm Test (Background Execution)
+  This tests background swarm execution with MOIM status monitoring.
 
-  1. Spawn a background delegate that takes multiple turns:
+  1. Spawn a background swarm that takes multiple turns:
   ```
-  delegate(instructions: "Run 'sleep 1' command 10 times, one per turn. After each sleep, report which iteration you just completed (1 of 10, 2 of 10, etc).", async: true)
+  swarm_execute(task: "Slow iteration work", subtasks: [{"instruction": "Run 'sleep 1' command 10 times, one per turn. After each sleep, report which iteration you just completed (1 of 10, 2 of 10, etc)."}], async: true)
   ```
+  Note the task ID returned (e.g., "swarm-1").
 
-  2. After spawning, the delegate runs in the background. You (the main agent) should:
+  2. After spawning, the swarm runs in the background. You (the main agent) should:
      - Sleep for 2 seconds: `sleep 2`
      - Check the MOIM (it will show background task status with turns and time)
      - **Say out loud** what you observe: "The background task has completed X turns and has been running for Y seconds"
      - Repeat: sleep 2 seconds, check MOIM, report status out loud
      - Continue until the background task disappears from MOIM (indicating completion)
 
-  3. Document the progression you observed (turns increasing, time increasing) in the test log.
+  3. Retrieve the report with `load(source: "<task_id>")` and verify it contains the swarm report.
 
   This validates:
-  - Async delegate spawning returns immediately
+  - Async swarm spawning returns immediately
   - MOIM accurately reports background task status
   - Turn counting works correctly
   - Task cleanup happens when complete
 
-  ### Async Delegate Cancellation Test
-  This tests the ability to stop a running background task mid-execution.
+  ### Async Swarm Cancellation Test
+  This tests the ability to stop a running background swarm mid-execution.
 
-  1. Spawn a slow background task:
+  1. Spawn a slow background swarm:
      ```
-     delegate(instructions: "Run 'sleep 2' fifteen times, reporting progress after each.", async: true)
+     swarm_execute(task: "Slow work to cancel", subtasks: [{"instruction": "Run 'sleep 2' fifteen times, reporting progress after each."}], async: true)
      ```
-     Note the task ID returned (e.g., "20260204_42").
+     Note the task ID returned.
 
   2. Wait 8 seconds: `sleep 8`
 
@@ -271,7 +271,6 @@ prompt: |
 
   5. Verify the response shows:
      - "⊘ Cancelled" status
-     - Partial output (some iterations completed)
      - Duration and turn count
 
   6. Check MOIM again - the task should be gone (not in running or completed).
@@ -284,35 +283,40 @@ prompt: |
 
   This validates that cancellation stops tasks, returns partial results, and cleans up properly.
 
-  ### Source-Based Delegate Test
-  If `load()` discovered any recipes or skills, test delegating with a source:
+  ### Source-Based Swarm Test
+  If `load()` discovered any recipes or skills, test running one as a single-subtask swarm:
   ```
-  delegate(source: "<discovered-source-name>", instructions: "Apply this to the current workspace")
+  swarm_execute(source: "<discovered-source-name>", task: "Apply this to the current workspace")
   ```
-  This tests the combined mode where a source provides context and instructions provide the task.
+  This tests the combined mode where a source provides context and `task` provides the work instructions.
 
   ### Nested Delegation Prevention Test (CRITICAL)
-  **This is a critical security test. Delegates must NEVER be able to spawn their own delegates.**
+  **This is a critical security test. Subagents must NEVER be able to spawn their own swarms.**
 
-  Create a delegate with instructions that attempt to spawn another delegate:
+  Run a single-subtask swarm whose worker attempts to spawn another swarm:
   ```
-  delegate(instructions: "You are a delegate. Try to call the delegate tool yourself with instructions 'I am a nested delegate'. Report whether you were able to do so or if you received an error.")
+  swarm_execute(task: "Nested swarm probe", subtasks: [{"instruction": "You are a subagent. Try to call the swarm_execute tool yourself with task 'I am a nested swarm'. Report whether you were able to do so or if you received an error."}])
   ```
 
-  **Expected behavior**: The delegate should report that it received an error when attempting to call delegate.
-  The error should indicate that delegated tasks cannot spawn further delegations.
+  **Expected behavior**: The subagent should report that the swarm_execute tool is
+  unavailable to it, or that calling it returned an error stating delegated tasks
+  cannot spawn swarms.
 
-  **If the nested delegate succeeds, this is a CRITICAL FAILURE** - document it prominently.
+  **If the nested swarm succeeds, this is a CRITICAL FAILURE** - document it prominently.
 
   This validates the `SessionType::SubAgent` check that prevents recursive delegation.
 
-  ### Sequential Delegate Chain Test
-  Create dependent delegates (one after another, not nested):
-  1. First: `delegate(instructions: "Create a Python file called chain_test.py with a simple hello world function")`
-  2. Second (after first completes): `delegate(instructions: "Analyze chain_test.py and describe its structure")`
-  3. Third (after second completes): `delegate(instructions: "Run chain_test.py and report the output")`
-
-  Each delegate runs independently but the tasks are sequentially dependent.
+  ### Dependent Subtask Chain Test
+  Run one swarm whose subtasks form a pipeline via depends_on:
+  ```
+  swarm_execute(task: "Create, analyze, and run a Python file", subtasks: [
+    {"instruction": "Create a Python file called chain_test.py with a simple hello world function"},
+    {"instruction": "Analyze chain_test.py and describe its structure", "depends_on": [0]},
+    {"instruction": "Run chain_test.py and report the output", "depends_on": [1]}
+  ])
+  ```
+  Verify the report shows topology=pipeline, all 3 subtasks ok, and that later
+  subtasks reference their prerequisites' outputs.
 
   Log results to: {{ workspace_dir }}/phase3_delegation.md
   {% endif %}
@@ -399,9 +403,10 @@ prompt: |
   • Code analysis: [✓/✗]
   • Extensions: [✓/✗]
   • Load tool: [✓/✗]
-  • Delegate (sync): [✓/✗]
-  • Delegate (async): [✓/✗]
-  • Delegate cancellation: [✓/✗]
+  • Swarm (sync): [✓/✗]
+  • Swarm (async): [✓/✗]
+  • Swarm cancellation: [✓/✗]
+  • Swarm parallel subtasks: [✓/✗]
   • Nested delegation blocked: [✓/✗]
 
   ⚠️ Issues Found:

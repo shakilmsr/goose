@@ -77,7 +77,7 @@ export const getToolIcon = (toolName: string): React.ComponentType<ToolIconProps
       return FileText;
 
     // Delegation Tools
-    case 'delegate':
+    case 'swarm_execute':
       return Delegate;
     case 'load':
       return Eye;

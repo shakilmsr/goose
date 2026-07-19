@@ -485,8 +485,8 @@ fn render_tool_request(req: &ToolRequest, theme: Theme, debug: bool) {
             name if is_shell_tool_name(name) => render_shell_request(call, debug),
             name if is_file_tool_name(name) => render_text_editor_request(call, debug),
             "execute_typescript" | "execute_code" => render_execute_code_request(call, debug),
-            "delegate" => render_delegate_request(call, debug),
             "subagent" => render_delegate_request(call, debug),
+            "swarm_execute" => render_delegate_request(call, debug),
             "todo__write" => render_todo_request(call, debug),
             "load" => {}
             _ => render_default_request(call, debug),
@@ -796,12 +796,21 @@ fn render_delegate_request(call: &CallToolRequestParams, debug: bool) {
             );
         }
 
+        if let Some(Value::String(task)) = args.get("task") {
+            let display = if task.len() > 100 && !debug {
+                safe_truncate(task, 100)
+            } else {
+                task.clone()
+            };
+            println!("    {} {}", style("task").dim(), style(display).dim());
+        }
+
         if let Some(Value::Object(params)) = args.get("parameters") {
             println!("    {}:", style("parameters").dim());
             print_params(&Some(params.clone()), 2, debug);
         }
 
-        let skip_keys = ["source", "instructions", "parameters"];
+        let skip_keys = ["source", "instructions", "task", "parameters"];
         let mut other_args = serde_json::Map::new();
         for (k, v) in args {
             if !skip_keys.contains(&k.as_str()) {

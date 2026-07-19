@@ -55,15 +55,17 @@ Added same day:
 
 Tests: `crates/goose/tests/swarm_test.rs` (29, covering all of the above with a fake spawner; breaker/concurrency tests use real short durations — tokio `start_paused` needs the `test-util` feature goose doesn't enable; the fake spawner tracks max-in-flight via atomics with a cancellation-safe drop guard, and overlap is proven with rendezvous barriers rather than sleeps — sleep-based overlap assertions flaked under parallel test load).
 
-## NEXT SESSION: START HERE (updated 2026-07-19)
+13. **Delegate absorbed into `swarm_execute`; delegate tool retired (2026-07-19)** — all four steps of the absorption plan landed in one pass:
+    - *No-planner fast path*: optional `subtasks` array param, validated via `parse_explicit_subtasks` → `decompose::parse_subtask_plan` (`FixedPlan` decomposer skips the planning LLM call). Hard error on invalid plans — no silent fallback for caller-supplied plans. `subtasks: [one item]` = the old single delegate, deterministic.
+    - *Async execution*: `async: true` on `swarm_execute` registers a `BackgroundTask` (ids `swarm-N` from a process-lifetime counter; `handle_load` routes by registry membership as well as session-id shape). `prepare_swarm` is the shared setup for sync/async; the background future renders the `SwarmReport`. Aggregate turn/idle tracking flows through a shared `OnMessageCallback` on the spawner. peek/cancel/moim all reuse the existing registry machinery.
+    - *Source-based runs*: `SubTask` gained `source`/`parameters`; plan entries may be source-only (instruction auto-generated). `resolve_subtask_sources` resolves every named source to a concrete `Recipe` up front (unknown name fails the run before any dispatch); the spawner extends the resolved recipe's prompt with the swarm material instead of building an ad-hoc recipe. Top-level `source` param = single-subtask swarm with `task` as its work instructions. `build_recipe_from_source` now fetches the session lazily (only the subrecipe values-merge branch needs it).
+    - *Retirement*: `delegate` removed from `list_tools` and `call_tool`; `handle_delegate`/`handle_async_delegate`/`create_delegate_tool`/`validate_delegate_params`/`get_task_description`/`build_delegate_recipe` deleted. `DelegateParams` slimmed+renamed `SubagentParams` (internal-only). Rewrote `swarm_execute` tool description (absorbed delegate's coaching), `build_subagent_instructions`, load discovery text, CLI render arm (`swarm_execute` renders via the old delegate renderer + `task` field), desktop icon/label mappings, and the Phase-3 sections of `goose-self-test.yaml`. Note: subagent sessions still cannot spawn swarms ("Delegated tasks cannot spawn swarms").
 
-**State:** All swarm work through concurrent dispatch is committed on `main` (HEAD `d8bf5ed5d`, 4 commits ahead of `origin/main`, not pushed). 29/29 tests green (`cargo test -p goose --test swarm_test`), fmt + clippy clean, and the engine is live-validated end to end (fan-out-join, 3 parallel subagents + synthesis join, envelopes, artifact hand-off) via `goose run` on `gemini-3-flash-preview`.
+## NEXT SESSION: START HERE (updated 2026-07-19, delegate absorption complete)
 
-**Next task: the delegate-absorption to-do list below.** Recommended order:
-1. **No-planner fast path** (smallest, immediately useful): add an optional `subtasks` array param to `swarm_execute` in `handle_swarm_execute` (`crates/goose/src/agents/platform_extensions/summon.rs`); validate it through `decompose::parse_subtask_plan` (already does cycle checks, dep normalization, lane/extension sanitization) and skip the `SemanticDecomposer` call when present.
-2. **Async execution**: mirror `handle_delegate`'s `async: true` path — it registers a `BackgroundTask` (registry + TTL cleanup are in the same file) and `load(task_id)` waits/peeks/cancels. The swarm run becomes the background future; the `SwarmReport` render is the task result.
-3. **Source-based runs**: `handle_delegate`'s `source` mode resolves subrecipes/recipes/agents (`get_sources`/`build_task_config`); reuse that resolution for a per-subtask `source` field or a top-level single-node-swarm form.
-4. Then the staged retirement steps in the checklist below.
+**State:** Delegate absorption (item 13) is complete in the working tree — commit it if not yet committed. 29/29 swarm tests + 32 summon unit tests green, fmt + clippy clean on `goose` and `goose-cli`. Live-validated end to end on `gemini-3-flash-preview`: explicit `subtasks` fast path (2-node pipeline, artifact hand-off between subtasks, envelopes, final output correct) via `goose run` in the WSL rig.
+
+**Next tasks are all in "Remaining / future work" below — ask the user which one before starting.**
 
 **Build/test (hermit is broken on this machine — use WSL Ubuntu):**
 ```
@@ -71,21 +73,15 @@ wsl -d Ubuntu -- bash -c "source ~/.cargo/env && cd /mnt/c/Users/shaki/DevProjec
 ```
 CLI binary: build with `--no-default-features --features portable-default` (default features fail on llama-cpp bindgen in WSL) → `~/goose-target/debug/goose`. A working live-test rig exists in WSL: config + Gemini OAuth tokens staged in `~/.config/goose/`, test workspace `~/swarm-live-test/`, run with `GOOSE_PROVIDER=gemini_oauth GOOSE_MODEL=gemini-3-flash-preview`. Gemini 3.5 Flash is unreachable via this OAuth (Code Assist API, individual tier) — it needs a `GOOGLE_API_KEY` with `GOOSE_PROVIDER=google`.
 
-## To-do: absorb `delegate` into `swarm_execute` (decided 2026-07-19)
+## Done: `delegate` absorbed into `swarm_execute` (completed 2026-07-19, see item 13)
 
-Direction (user decision): retire the `delegate` tool surface and let `swarm_execute` absorb it — the old delegate is the degenerate one-node swarm. Do NOT nest swarm inside delegate. Removing delegate removes only the tool surface (`create_delegate_tool`, `handle_delegate`, description); the shared machinery (`run_subagent_task`, `build_adhoc_recipe`, `build_task_config`, notification bridge, background-task registry) stays — the swarm spawner runs on it.
+Direction (user decision): retire the `delegate` tool surface and let `swarm_execute` absorb it — the old delegate is the degenerate one-node swarm. The shared machinery (`run_subagent_task`, `build_adhoc_recipe`, `build_task_config`, notification bridge, background-task registry) stays — the swarm spawner runs on it.
 
-Close these three gaps in `swarm_execute` first:
-
-- [ ] **Async execution** — `async: true` returns a task id immediately (parent keeps working), `load(task_id)` waits/returns the swarm report, `peek` checks progress, cancel works. Reuse the existing `BackgroundTask` registry exactly as delegate does today.
-- [ ] **Source-based runs** — named subrecipes/recipes/agents (today only runnable via `delegate(source: ...)`) become runnable as swarm subtasks (`source` field per subtask) or as a top-level `source` param running a single-node swarm. `load` remains the source browser.
-- [ ] **No-planner fast path** — optional `subtasks` parameter: caller supplies the plan explicitly, validated through `parse_subtask_plan` (cycle checks, lane/extension sanitization). `task` alone → semantic planner; `subtasks: [one item]` → exact old-delegate behavior, deterministic, no extra planning LLM call.
-
-Then retire delegate in stages:
-
-- [ ] Drop `delegate` from `list_tools` (models stop seeing it; handler briefly stays as dead code).
-- [ ] Delete `handle_delegate` + `create_delegate_tool`; update the `list_tools` test (asserts `"delegate"`), `goose-self-test.yaml`, and any UI strings referencing delegate.
-- [ ] Rewrite `swarm_execute`'s tool description (it currently says "Use plain `delegate` for a single self-contained task") and remove the delegate/load-loop coaching that lived in delegate's description.
+- [x] **Async execution** — `async: true` + `load(task_id)` wait/peek/cancel via the existing `BackgroundTask` registry.
+- [x] **Source-based runs** — per-subtask `source` field and top-level `source` param; `load` remains the source browser.
+- [x] **No-planner fast path** — optional `subtasks` parameter validated through `parse_subtask_plan`; `subtasks: [one item]` = old-delegate behavior.
+- [x] Delegate dropped from `list_tools`; handlers deleted; tests, `goose-self-test.yaml`, CLI renderer, and desktop UI strings updated.
+- [x] `swarm_execute` tool description rewritten with the absorbed delegation coaching.
 
 **Remaining / future work (ask the user before starting):**
 - Per-subtask model/tier routing: `roster::AgentConfig.model` exists but the spawner inherits the parent session's model for every subtask; needs a tier→model mapping decision (config surface) before wiring in.
