@@ -55,6 +55,22 @@ Added same day:
 
 Tests: `crates/goose/tests/swarm_test.rs` (29, covering all of the above with a fake spawner; breaker/concurrency tests use real short durations — tokio `start_paused` needs the `test-util` feature goose doesn't enable; the fake spawner tracks max-in-flight via atomics with a cancellation-safe drop guard, and overlap is proven with rendezvous barriers rather than sleeps — sleep-based overlap assertions flaked under parallel test load).
 
+## NEXT SESSION: START HERE (updated 2026-07-19)
+
+**State:** All swarm work through concurrent dispatch is committed on `main` (HEAD `d8bf5ed5d`, 4 commits ahead of `origin/main`, not pushed). 29/29 tests green (`cargo test -p goose --test swarm_test`), fmt + clippy clean, and the engine is live-validated end to end (fan-out-join, 3 parallel subagents + synthesis join, envelopes, artifact hand-off) via `goose run` on `gemini-3-flash-preview`.
+
+**Next task: the delegate-absorption to-do list below.** Recommended order:
+1. **No-planner fast path** (smallest, immediately useful): add an optional `subtasks` array param to `swarm_execute` in `handle_swarm_execute` (`crates/goose/src/agents/platform_extensions/summon.rs`); validate it through `decompose::parse_subtask_plan` (already does cycle checks, dep normalization, lane/extension sanitization) and skip the `SemanticDecomposer` call when present.
+2. **Async execution**: mirror `handle_delegate`'s `async: true` path — it registers a `BackgroundTask` (registry + TTL cleanup are in the same file) and `load(task_id)` waits/peeks/cancels. The swarm run becomes the background future; the `SwarmReport` render is the task result.
+3. **Source-based runs**: `handle_delegate`'s `source` mode resolves subrecipes/recipes/agents (`get_sources`/`build_task_config`); reuse that resolution for a per-subtask `source` field or a top-level single-node-swarm form.
+4. Then the staged retirement steps in the checklist below.
+
+**Build/test (hermit is broken on this machine — use WSL Ubuntu):**
+```
+wsl -d Ubuntu -- bash -c "source ~/.cargo/env && cd /mnt/c/Users/shaki/DevProjects/Goose+Swarm && CARGO_TARGET_DIR=~/goose-target cargo test -p goose --test swarm_test"
+```
+CLI binary: build with `--no-default-features --features portable-default` (default features fail on llama-cpp bindgen in WSL) → `~/goose-target/debug/goose`. A working live-test rig exists in WSL: config + Gemini OAuth tokens staged in `~/.config/goose/`, test workspace `~/swarm-live-test/`, run with `GOOSE_PROVIDER=gemini_oauth GOOSE_MODEL=gemini-3-flash-preview`. Gemini 3.5 Flash is unreachable via this OAuth (Code Assist API, individual tier) — it needs a `GOOGLE_API_KEY` with `GOOSE_PROVIDER=google`.
+
 ## To-do: absorb `delegate` into `swarm_execute` (decided 2026-07-19)
 
 Direction (user decision): retire the `delegate` tool surface and let `swarm_execute` absorb it — the old delegate is the degenerate one-node swarm. Do NOT nest swarm inside delegate. Removing delegate removes only the tool surface (`create_delegate_tool`, `handle_delegate`, description); the shared machinery (`run_subagent_task`, `build_adhoc_recipe`, `build_task_config`, notification bridge, background-task registry) stays — the swarm spawner runs on it.
@@ -79,7 +95,8 @@ Then retire delegate in stages:
 - Surfacing swarm progress to the UI beyond tool notifications.
 
 ## 4. Crucial Developer Environment Notes
-- **Hermit Environment**: The workspace uses Hermit for environment management. Bare commands like `cargo fmt` or `cargo build` will fail natively in Windows PowerShell. Future automated agents must run these via `bash` using `source bin/activate-hermit` (if WSL/GitBash is available), or simply write code and leave the compilation/build tasks to the user's Hermit terminal.
+- **Hermit Environment**: The workspace uses Hermit for environment management. Bare commands like `cargo fmt` or `cargo build` will fail natively in Windows PowerShell. On this machine the hermit shims are broken in both Git Bash and WSL (CRLF checkout); the working path is WSL Ubuntu rustup 1.92 with `CARGO_TARGET_DIR` on the Linux filesystem — see the START HERE section for exact commands.
+- **Installed Windows goose is NOT this code**: the `goose` on the Windows PATH / `%APPDATA%\Block\goose` is the stock Block release — it has no `swarm_execute`. Only the WSL-built binary (`~/goose-target/debug/goose`) contains the swarm work.
 - **Goose Structure**: 
   - Main Agent Logic: `crates/goose/src/agents/agent.rs`
   - Subagent Runner: `crates/goose/src/agents/subagent_handler.rs`
