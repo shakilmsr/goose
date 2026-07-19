@@ -84,3 +84,6 @@ result
 # Goose self-test artifacts
 gooseselftest/
 .tasks/
+
+# SwarmOS repository (cloned as a sparse checkout)
+SwarmOS/

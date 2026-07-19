@@ -9,10 +9,14 @@ use crate::config::{Config, GooseMode};
 use crate::providers;
 use crate::recipe::build_recipe::build_recipe_from_template;
 use crate::recipe::local_recipes::load_local_recipe_file;
-use crate::recipe::{Recipe, RecipeParameter, Settings, RECIPE_FILE_EXTENSIONS};
+use crate::recipe::{Recipe, RecipeParameter, Response, Settings, RECIPE_FILE_EXTENSIONS};
 use crate::session::extension_data::EnabledExtensionsState;
 use crate::session::SessionType;
 use crate::sources::parse_frontmatter;
+use crate::swarm::decompose::{usable_budget, SemanticDecomposer, SubTask};
+use crate::swarm::envelope::{envelope_schema_for, interpret_subtask_output, SubtaskOutcome};
+use crate::swarm::kernel::{AgentSpawner, Kernel, SubtaskResult, SwarmReport};
+use crate::swarm::roster::AgentConfig as SwarmAgentConfig;
 use crate::utils::safe_truncate;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -62,6 +66,21 @@ pub struct DelegateParams {
     pub working_dir: Option<String>,
     #[serde(default)]
     pub r#async: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SwarmExecuteParams {
+    pub task: String,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub max_turns: Option<usize>,
+    #[serde(default)]
+    pub subtask_timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub max_duration_secs: Option<u64>,
 }
 
 pub struct BackgroundTask {
@@ -616,6 +635,149 @@ impl SummonClient {
                 .to_string(),
             schema.as_object().unwrap().clone(),
         )
+    }
+
+    fn create_swarm_tool(&self) -> Tool {
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["task"],
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "The complex task to run as a swarm. Pass the full task verbatim, including any lists, constraints, and reference material — the decomposer only sees this text."
+                },
+                "provider": {
+                    "type": "string",
+                    "description": "Override LLM provider for the swarm's agents."
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Override model for the swarm's agents."
+                },
+                "max_turns": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Maximum turns per subtask agent."
+                },
+                "subtask_timeout_secs": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Wall-clock timeout per subtask attempt; a timed-out attempt is retried up to the retry budget."
+                },
+                "max_duration_secs": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Wall-clock circuit breaker for the whole swarm run; when exceeded, no further subtasks dispatch."
+                }
+            }
+        });
+
+        Tool::new(
+            "swarm_execute",
+            "Run a complex task as an orchestrated swarm of subagents.\n\n\
+             The task is semantically decomposed into a dependency graph of subtasks, a \
+             topology (pipeline, fan-out-join, or general DAG) is selected from that graph, \
+             and each subtask runs as an independent subagent. Outputs pass between subtasks \
+             through a shared scratch pad — each dependent receives exactly its prerequisites' \
+             outputs — and the final sink output(s) are returned here.\n\n\
+             Use this instead of manual delegate/load loops when a task has multiple distinct \
+             parts or ordered phases. Use plain `delegate` for a single self-contained task."
+                .to_string(),
+            schema.as_object().unwrap().clone(),
+        )
+    }
+
+    async fn handle_swarm_execute(
+        &self,
+        session_id: &str,
+        arguments: Option<JsonObject>,
+        cancellation_token: CancellationToken,
+    ) -> Result<CallToolResult, String> {
+        let params: SwarmExecuteParams = arguments
+            .map(|args| serde_json::from_value(serde_json::Value::Object(args)))
+            .transpose()
+            .map_err(|e| format!("Invalid parameters: {}", e))?
+            .ok_or("Missing parameters: 'task' is required")?;
+
+        if params.task.trim().is_empty() {
+            return Err("'task' must be a non-empty string".to_string());
+        }
+        if let Some(max) = params.max_turns {
+            if max < 1 {
+                return Err("'max_turns' must be at least 1".to_string());
+            }
+        }
+
+        let session = self
+            .context
+            .session_manager
+            .get_session(session_id, false)
+            .await
+            .map_err(|e| format!("Failed to get session: {}", e))?;
+
+        if session.session_type == SessionType::SubAgent {
+            return Err("Delegated tasks cannot spawn swarms".to_string());
+        }
+
+        let delegate_params = DelegateParams {
+            instructions: Some(params.task.clone()),
+            provider: params.provider.clone(),
+            model: params.model.clone(),
+            max_turns: params.max_turns,
+            ..Default::default()
+        };
+        let recipe = self.build_adhoc_recipe(&delegate_params)?;
+        let task_config = self
+            .build_task_config(&delegate_params, &recipe, &session)
+            .await
+            .map_err(|e| format!("Failed to build task config: {}", e))?;
+
+        let available_extensions: Vec<String> =
+            task_config.extensions.iter().map(|e| e.name()).collect();
+        let decomposer = SemanticDecomposer::new(
+            task_config.provider.clone(),
+            task_config.model_config.clone(),
+        )
+        .with_available_extensions(available_extensions);
+
+        let workspace_root = session
+            .working_dir
+            .join(".goose-swarm")
+            .join(format!("run-{}", current_epoch_millis()));
+        std::fs::create_dir_all(&workspace_root)
+            .map_err(|e| format!("Failed to create swarm workspace: {}", e))?;
+
+        let (notif_tx, notif_rx) = tokio::sync::mpsc::unbounded_channel::<ServerNotification>();
+        Self::spawn_notification_bridge(
+            notif_rx,
+            Arc::clone(&self.notification_subscribers),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+
+        let spawner = Arc::new(SummonAgentSpawner {
+            session_manager: self.context.session_manager.clone(),
+            task_config,
+            use_login_shell_path: self.context.use_login_shell_path,
+            cancellation_token,
+            notification_tx: notif_tx,
+            workspace_root,
+        });
+
+        let mut kernel = Kernel::new(spawner);
+        if let Some(secs) = params.subtask_timeout_secs {
+            kernel = kernel.with_subtask_timeout(Duration::from_secs(secs));
+        }
+        if let Some(secs) = params.max_duration_secs {
+            kernel = kernel.with_max_run_duration(Duration::from_secs(secs));
+        }
+        let report = kernel
+            .run(&params.task, &decomposer)
+            .await
+            .map_err(|e| format!("Swarm execution failed: {}", e))?;
+
+        Ok(CallToolResult::success(vec![Content::text(
+            render_swarm_report(&report),
+        )]))
     }
 
     async fn get_working_dir(&self, session_id: &str) -> PathBuf {
@@ -1874,6 +2036,219 @@ impl SummonClient {
     }
 }
 
+/// [`AgentSpawner`] backed by Goose's real subagent machinery: each subtask runs
+/// as its own ephemeral subagent session via `run_subagent_task`, inheriting the
+/// parent session's provider, extensions, and working directory.
+struct SummonAgentSpawner {
+    session_manager: Arc<crate::session::SessionManager>,
+    task_config: TaskConfig,
+    use_login_shell_path: bool,
+    cancellation_token: CancellationToken,
+    notification_tx: tokio::sync::mpsc::UnboundedSender<ServerNotification>,
+    workspace_root: PathBuf,
+}
+
+impl SummonAgentSpawner {
+    /// Least-privilege extension scoping: keep only the subtask's declared
+    /// extensions, failing open (full inheritance) when the declaration matches
+    /// nothing real — a planner typo must not strand a subtask without tools.
+    fn scoped_task_config(&self, subtask: &SubTask) -> TaskConfig {
+        let mut task_config = self.task_config.clone();
+        if !subtask.required_extensions.is_empty() {
+            let filtered: Vec<_> = task_config
+                .extensions
+                .iter()
+                .filter(|e| subtask.required_extensions.iter().any(|r| *r == e.name()))
+                .cloned()
+                .collect();
+            if filtered.is_empty() {
+                warn!(
+                    "subtask {} required extensions {:?} matched none of the session's; \
+                     inheriting all",
+                    subtask.id, subtask.required_extensions
+                );
+            } else {
+                task_config.extensions = filtered;
+            }
+        }
+        task_config
+    }
+}
+
+fn collect_artifact_files(dir: &Path) -> Vec<String> {
+    let mut files = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        if let Ok(entries) = std::fs::read_dir(&current) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    files.push(path.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+#[async_trait]
+impl AgentSpawner for SummonAgentSpawner {
+    async fn run_subtask(
+        &self,
+        subtask: &SubTask,
+        agent: &SwarmAgentConfig,
+        dependency_context: &str,
+    ) -> Result<SubtaskResult> {
+        let artifact_dir = self.workspace_root.join(&subtask.id);
+        if let Err(e) = std::fs::create_dir_all(&artifact_dir) {
+            warn!("failed to create artifact dir for {}: {}", subtask.id, e);
+        }
+
+        let mut prompt = subtask.instruction.clone();
+        if !subtask.content.is_empty() {
+            prompt.push_str("\n\nReference material:\n");
+            prompt.push_str(&subtask.content);
+        }
+        if !dependency_context.is_empty() {
+            prompt.push_str("\n\nOutputs from prerequisite subtasks:\n");
+            prompt.push_str(dependency_context);
+        }
+        prompt.push_str(&format!(
+            "\n\nArtifact directory: {}\nWrite any file deliverables (scripts, code, data \
+             files) into that directory so downstream steps can use them.",
+            artifact_dir.to_string_lossy().replace('\\', "/")
+        ));
+        if subtask.workspace_writes.is_empty() {
+            prompt.push_str(
+                "\nDo not create or modify repository files unless your instruction \
+                 explicitly requires it.",
+            );
+        } else {
+            prompt.push_str(&format!(
+                "\nYour declared write lanes in the repository are: {}. Do not write \
+                 repository paths outside these lanes.",
+                subtask.workspace_writes.join(", ")
+            ));
+        }
+
+        let mut recipe = Recipe::builder()
+            .version("1.0.0")
+            .title(format!("Swarm subtask {}", subtask.id))
+            .description(format!("Swarm {} subtask", agent.role))
+            .instructions(&agent.system_prompt)
+            .prompt(&prompt)
+            .build()
+            .map_err(|e| anyhow::anyhow!("Failed to build swarm subtask recipe: {}", e))?;
+        recipe.response = Some(Response {
+            json_schema: Some(envelope_schema_for(subtask.output_schema.as_ref())),
+        });
+
+        let agent_config = AgentConfig::new(
+            self.session_manager.clone(),
+            crate::config::permission::PermissionManager::instance(),
+            None,
+            GooseMode::Auto,
+            true, // disable session naming for subagents
+            crate::agents::GoosePlatform::GooseCli,
+        )
+        .with_use_login_shell_path(self.use_login_shell_path);
+
+        let subagent_session = self
+            .session_manager
+            .create_session(
+                self.task_config.parent_working_dir.clone(),
+                safe_truncate(
+                    &format!("Swarm {}: {}", subtask.id, subtask.instruction),
+                    TASK_LABEL_BUDGET,
+                ),
+                SessionType::SubAgent,
+                GooseMode::Auto,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to create subagent session: {}", e))?;
+
+        let raw = run_subagent_task(SubagentRunParams {
+            config: agent_config,
+            recipe,
+            task_config: self.scoped_task_config(subtask),
+            return_last_only: true,
+            session_id: subagent_session.id,
+            cancellation_token: Some(self.cancellation_token.child_token()),
+            on_message: None,
+            notification_tx: Some(self.notification_tx.clone()),
+        })
+        .await?;
+
+        match interpret_subtask_output(&raw) {
+            SubtaskOutcome::Success(output) => Ok(SubtaskResult {
+                output,
+                artifacts: collect_artifact_files(&artifact_dir),
+            }),
+            SubtaskOutcome::Failed(reason) => Err(anyhow::anyhow!(
+                "subtask {} reported failure: {}",
+                subtask.id,
+                reason
+            )),
+        }
+    }
+
+    fn prompt_token_budget(&self) -> Option<usize> {
+        Some(usable_budget(self.task_config.model_config.context_limit()))
+    }
+}
+
+fn render_swarm_report(report: &SwarmReport) -> String {
+    let mut out = format!(
+        "Swarm run complete: {} subtask(s), topology={}, {} dispatched, {} failed.\n",
+        report.subtasks.len(),
+        report.topology.as_str(),
+        report.dispatches,
+        report.failures.len(),
+    );
+    for st in &report.subtasks {
+        let status = if report.outputs.contains_key(&st.id) {
+            "ok"
+        } else if report.failures.iter().any(|f| f.subtask_id == st.id) {
+            "FAILED"
+        } else {
+            "blocked"
+        };
+        out.push_str(&format!(
+            "  [{}] {} — {}\n",
+            status,
+            st.id,
+            safe_truncate(&st.instruction, SUBAGENT_DESCRIPTION_BUDGET)
+        ));
+    }
+    for f in &report.failures {
+        out.push_str(&format!(
+            "\nFailure in {} after {} attempt(s): {}\n",
+            f.subtask_id, f.attempts, f.error
+        ));
+    }
+    if let Some(reason) = &report.halted {
+        out.push_str(&format!("\nRun halted early: {}\n", reason));
+    }
+    if !report.artifacts.is_empty() {
+        out.push_str("\nArtifact files produced:\n");
+        for (subtask_id, paths) in &report.artifacts {
+            for path in paths {
+                out.push_str(&format!("  {} — {}\n", subtask_id, path));
+            }
+        }
+    }
+    if report.final_output.is_empty() {
+        out.push_str("\nNo final output was produced.");
+    } else {
+        out.push_str("\n=== Final output ===\n");
+        out.push_str(&report.final_output);
+    }
+    out
+}
+
 #[async_trait]
 impl McpClientTrait for SummonClient {
     async fn list_tools(
@@ -1896,6 +2271,7 @@ impl McpClientTrait for SummonClient {
 
         if !is_subagent {
             tools.push(self.create_delegate_tool());
+            tools.push(self.create_swarm_tool());
         }
 
         Ok(ListToolsResult {
@@ -1924,6 +2300,18 @@ impl McpClientTrait for SummonClient {
             "delegate" => {
                 match self
                     .handle_delegate(session_id, arguments, cancellation_token)
+                    .await
+                {
+                    Ok(result) => Ok(result),
+                    Err(error) => Ok(CallToolResult::error(vec![Content::text(format!(
+                        "Error: {}",
+                        error
+                    ))])),
+                }
+            }
+            "swarm_execute" => {
+                match self
+                    .handle_swarm_execute(session_id, arguments, cancellation_token)
                     .await
                 {
                     Ok(result) => Ok(result),
