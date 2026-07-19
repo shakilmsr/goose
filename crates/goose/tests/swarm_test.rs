@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use goose::swarm::decompose::{
     has_cycle, parse_subtask_plan, sink_ids, split_to_fit, structural_decompose_with_budget,
-    Decomposer, StructuralDecomposer, SubTask,
+    Decomposer, PlanTrust, StructuralDecomposer, SubTask, Tier,
 };
 use goose::swarm::envelope::{
     envelope_schema, envelope_schema_for, interpret_subtask_output, SubtaskOutcome,
@@ -120,7 +120,7 @@ impl AgentSpawner for FakeSpawner {
         })
     }
 
-    fn prompt_token_budget(&self) -> Option<usize> {
+    fn prompt_token_budget(&self, _subtask: &SubTask) -> Option<usize> {
         self.budget
     }
 }
@@ -159,7 +159,7 @@ fn parse_plan_normalizes_index_and_id_dependencies() {
   {"instruction": "draft", "depends_on": [0]},
   {"instruction": "review", "depends_on": ["subtask-2", "subtask-2", 1]}
 ]"#;
-    let subtasks = parse_subtask_plan(text, 16, &[]).unwrap();
+    let subtasks = parse_subtask_plan(text, 16, &[], PlanTrust::Planner).unwrap();
     assert_eq!(subtasks.len(), 3);
     assert_eq!(subtasks[1].dependencies, vec!["subtask-1"]);
     // duplicate deps collapse so join_after matches distinct completion events
@@ -169,13 +169,15 @@ fn parse_plan_normalizes_index_and_id_dependencies() {
 
 #[test]
 fn parse_plan_rejects_empty_instruction_and_cycles() {
-    assert!(parse_subtask_plan(r#"[{"instruction": "  "}]"#, 16, &[]).is_none());
+    assert!(
+        parse_subtask_plan(r#"[{"instruction": "  "}]"#, 16, &[], PlanTrust::Planner).is_none()
+    );
     let cyclic = r#"[
       {"instruction": "a", "depends_on": [1]},
       {"instruction": "b", "depends_on": [0]}
     ]"#;
-    assert!(parse_subtask_plan(cyclic, 16, &[]).is_none());
-    assert!(parse_subtask_plan("no json here", 16, &[]).is_none());
+    assert!(parse_subtask_plan(cyclic, 16, &[], PlanTrust::Planner).is_none());
+    assert!(parse_subtask_plan("no json here", 16, &[], PlanTrust::Planner).is_none());
 }
 
 #[test]
@@ -548,7 +550,7 @@ fn parse_plan_accepts_valid_output_schema_and_drops_invalid() {
        "output_schema": {"type": 123}},
       {"instruction": "report", "depends_on": [1], "output_schema": {}}
     ]"#;
-    let subtasks = parse_subtask_plan(text, 16, &[]).unwrap();
+    let subtasks = parse_subtask_plan(text, 16, &[], PlanTrust::Planner).unwrap();
     assert_eq!(subtasks.len(), 3);
     assert!(subtasks[0].output_schema.is_some());
     assert_eq!(
@@ -658,9 +660,43 @@ fn parse_plan_sanitizes_lanes_and_extensions() {
        "required_extensions": ["developer", "made_up_ext", "developer"]}
     ]"#;
     let available = vec!["developer".to_string(), "memory".to_string()];
-    let subtasks = parse_subtask_plan(text, 16, &available).unwrap();
+    let subtasks = parse_subtask_plan(text, 16, &available, PlanTrust::Planner).unwrap();
     assert_eq!(subtasks[0].workspace_writes, vec!["src/lib.rs"]);
     assert_eq!(subtasks[0].required_extensions, vec!["developer"]);
+}
+
+// ── model/tier routing ───────────────────────────────────────────────────────
+
+#[test]
+fn parse_plan_normalizes_tiers_and_gates_models_by_trust() {
+    let text = r#"[
+      {"instruction": "extract", "tier": "light", "model": "some-cheap-model"},
+      {"instruction": "synthesize", "tier": " HEAVY ", "depends_on": [0]},
+      {"instruction": "misc", "tier": "turbo"},
+      {"instruction": "plain"}
+    ]"#;
+    let planner = parse_subtask_plan(text, 16, &[], PlanTrust::Planner).unwrap();
+    assert_eq!(planner[0].tier, Tier::Light);
+    // a planner LLM routes via tiers only — its model names are dropped
+    assert!(planner[0].model.is_none());
+    assert_eq!(planner[1].tier, Tier::Heavy);
+    // unknown tiers and absent tiers both normalize to standard
+    assert_eq!(planner[2].tier, Tier::Standard);
+    assert_eq!(planner[3].tier, Tier::Standard);
+
+    let caller = parse_subtask_plan(text, 16, &[], PlanTrust::Caller).unwrap();
+    assert_eq!(caller[0].model.as_deref(), Some("some-cheap-model"));
+    assert_eq!(caller[0].tier, Tier::Light);
+}
+
+#[test]
+fn derived_roster_agent_carries_pinned_model() {
+    let mut st = subtask("subtask-1", &[]);
+    st.model = Some("pinned-model".to_string());
+    let agent = AgentConfig::derived_for(&st);
+    assert_eq!(agent.model.as_deref(), Some("pinned-model"));
+    let plain = AgentConfig::derived_for(&subtask("subtask-2", &[]));
+    assert!(plain.model.is_none());
 }
 
 // ── artifacts ────────────────────────────────────────────────────────────────

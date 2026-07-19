@@ -105,10 +105,11 @@ pub trait AgentSpawner: Send + Sync {
     ) -> Result<SubtaskResult>;
 
     /// Usable token budget for one subtask's prompt material (instruction +
-    /// content + dependency context). `None` means unbounded. The kernel enforces
-    /// this at dispatch so a subagent's context is never silently overflowed into
-    /// mid-task compaction.
-    fn prompt_token_budget(&self) -> Option<usize> {
+    /// content + dependency context). `None` means unbounded. Per-subtask because
+    /// tier/model routing can give subtasks different context windows. The kernel
+    /// enforces this at dispatch so a subagent's context is never silently
+    /// overflowed into mid-task compaction.
+    fn prompt_token_budget(&self, _subtask: &SubTask) -> Option<usize> {
         None
     }
 }
@@ -420,7 +421,7 @@ impl NodeDispatch {
     async fn run(self) -> Option<NodeFailure> {
         let mut dependency_context =
             gather_dependency_context(&self.scratch_pad, &self.subtask).await;
-        if let Some(budget) = self.spawner.prompt_token_budget() {
+        if let Some(budget) = self.spawner.prompt_token_budget(&self.subtask) {
             dependency_context =
                 fit_dependency_context(&self.subtask, dependency_context, budget).await;
         }

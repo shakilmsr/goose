@@ -14,8 +14,8 @@ use crate::session::extension_data::EnabledExtensionsState;
 use crate::session::SessionType;
 use crate::sources::parse_frontmatter;
 use crate::swarm::decompose::{
-    parse_subtask_plan, usable_budget, Decomposer, FixedPlan, SemanticDecomposer, SubTask,
-    MAX_SUBTASKS,
+    parse_subtask_plan, usable_budget, Decomposer, FixedPlan, PlanTrust, SemanticDecomposer,
+    SubTask, Tier, MAX_SUBTASKS,
 };
 use crate::swarm::envelope::{envelope_schema_for, interpret_subtask_output, SubtaskOutcome};
 use crate::swarm::kernel::{AgentSpawner, Kernel, SubtaskResult, SwarmReport};
@@ -84,6 +84,8 @@ pub struct SwarmExecuteParams {
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
+    pub models: Option<HashMap<String, String>>,
+    #[serde(default)]
     pub max_turns: Option<usize>,
     #[serde(default)]
     pub subtask_timeout_secs: Option<u64>,
@@ -116,11 +118,13 @@ fn parse_explicit_subtasks(
         ));
     }
     let text = serde_json::to_string(value).map_err(|e| e.to_string())?;
-    parse_subtask_plan(&text, MAX_SUBTASKS, available_extensions).ok_or_else(|| {
-        "'subtasks' is not a valid plan: every entry needs a non-empty 'instruction', \
-         and 'depends_on' (zero-based indices) must reference other entries without cycles"
-            .to_string()
-    })
+    parse_subtask_plan(&text, MAX_SUBTASKS, available_extensions, PlanTrust::Caller).ok_or_else(
+        || {
+            "'subtasks' is not a valid plan: every entry needs a non-empty 'instruction', \
+             and 'depends_on' (zero-based indices) must reference other entries without cycles"
+                .to_string()
+        },
+    )
 }
 
 pub struct BackgroundTask {
@@ -649,6 +653,15 @@ impl SummonClient {
                                 "type": "array",
                                 "items": {"type": "string"},
                                 "description": "Extension names this subtask needs; omit to inherit all."
+                            },
+                            "tier": {
+                                "type": "string",
+                                "enum": ["light", "standard", "heavy"],
+                                "description": "Compute class for this subtask: light for mechanical work, heavy for deep reasoning or synthesis. Routed to a model via the 'models' param or GOOSE_SWARM_MODEL_* config; unmapped tiers use the swarm's base model."
+                            },
+                            "model": {
+                                "type": "string",
+                                "description": "Exact model for this subtask, overriding tier routing. Must be valid for the swarm's provider."
                             }
                         }
                     }
@@ -669,6 +682,16 @@ impl SummonClient {
                 "model": {
                     "type": "string",
                     "description": "Override model for the swarm's agents."
+                },
+                "models": {
+                    "type": "object",
+                    "properties": {
+                        "light": {"type": "string"},
+                        "standard": {"type": "string"},
+                        "heavy": {"type": "string"}
+                    },
+                    "additionalProperties": false,
+                    "description": "Per-run tier→model map for subtasks tagged with a tier. Overrides the GOOSE_SWARM_MODEL_LIGHT/STANDARD/HEAVY config keys; tiers mapped nowhere use the swarm's base model."
                 },
                 "max_turns": {
                     "type": "integer",
@@ -719,6 +742,9 @@ impl SummonClient {
              - Workers cannot coordinate beyond declared dependencies. Same-file work = \
              conflicts: partition files via workspace_writes; never two subtasks on one file.\n\
              - Research (read-only) parallelizes freely; write work must be partitioned.\n\
+             - Subtasks may carry a tier (light/standard/heavy) or an exact model; the \
+             `models` param or GOOSE_SWARM_MODEL_* config maps tiers to models so cheap \
+             mechanical work and deep reasoning run on different models.\n\
              - For long-running work pass `async: true`, keep working, and collect the report \
              with load(source: \"<task_id>\")."
                 .to_string(),
@@ -828,6 +854,9 @@ impl SummonClient {
             .build_task_config(&subagent_params, &recipe, session)
             .await
             .map_err(|e| format!("Failed to build task config: {}", e))?;
+        let provider_name = self
+            .resolve_provider_name(&subagent_params, &recipe, session)
+            .map_err(|e| e.to_string())?;
 
         let available_extensions: Vec<String> =
             task_config.extensions.iter().map(|e| e.name()).collect();
@@ -847,6 +876,12 @@ impl SummonClient {
             Some(plan) => self.resolve_subtask_sources(plan, session).await?,
             None => HashMap::new(),
         };
+        let swarm_models = resolve_swarm_models(
+            params,
+            &task_config.model_config,
+            &provider_name,
+            explicit_plan.as_deref(),
+        )?;
         let decomposer: Box<dyn Decomposer> = match explicit_plan {
             Some(plan) => Box::new(FixedPlan(plan)),
             None => Box::new(
@@ -881,6 +916,7 @@ impl SummonClient {
             workspace_root,
             on_message,
             source_recipes,
+            models: swarm_models,
         });
 
         let mut kernel = Kernel::new(spawner).with_max_concurrency(
@@ -1846,26 +1882,7 @@ impl SummonClient {
             });
 
         if let Some(model) = override_model {
-            if model != model_config.model_name {
-                // Build the new config from scratch so canonical fields
-                // (context_limit, max_tokens, reasoning) and env-derived
-                // overrides (GOOSE_CONTEXT_LIMIT, GOOSE_MAX_TOKENS) match the
-                // overridden model, then preserve session-level state that is
-                // not model-specific from the parent.
-                let parent = model_config;
-                let mut cfg =
-                    crate::model_config::model_config_from_user_config(provider_name, &model)?;
-                cfg.toolshim = parent.toolshim;
-                cfg.toolshim_model = parent.toolshim_model;
-                cfg.temperature = cfg.temperature.or(parent.temperature);
-                if let Some(parent_params) = parent.request_params {
-                    let merged = cfg.request_params.get_or_insert_with(Default::default);
-                    for (k, v) in parent_params {
-                        merged.insert(k, v);
-                    }
-                }
-                model_config = cfg;
-            }
+            model_config = override_model_config(&model_config, provider_name, &model)?;
         }
 
         if let Some(temp) = params.temperature {
@@ -1877,19 +1894,13 @@ impl SummonClient {
         Ok(model_config)
     }
 
-    async fn resolve_provider(
+    fn resolve_provider_name(
         &self,
         params: &SubagentParams,
         recipe: &Recipe,
         session: &crate::session::Session,
-    ) -> Result<
-        (
-            Arc<dyn crate::providers::base::Provider>,
-            goose_providers::model::ModelConfig,
-        ),
-        anyhow::Error,
-    > {
-        let provider_name = params
+    ) -> Result<String, anyhow::Error> {
+        params
             .provider
             .clone()
             .or_else(|| {
@@ -1904,8 +1915,22 @@ impl SummonClient {
                     .ok()
             })
             .or_else(|| session.provider_name.clone())
-            .ok_or_else(|| anyhow::anyhow!("No provider configured"))?;
+            .ok_or_else(|| anyhow::anyhow!("No provider configured"))
+    }
 
+    async fn resolve_provider(
+        &self,
+        params: &SubagentParams,
+        recipe: &Recipe,
+        session: &crate::session::Session,
+    ) -> Result<
+        (
+            Arc<dyn crate::providers::base::Provider>,
+            goose_providers::model::ModelConfig,
+        ),
+        anyhow::Error,
+    > {
+        let provider_name = self.resolve_provider_name(params, recipe, session)?;
         let model_config = self.resolve_model_config(params, recipe, session, &provider_name)?;
         let provider = providers::create(&provider_name, Vec::new()).await?;
         Ok((provider, model_config))
@@ -1982,6 +2007,137 @@ impl SummonClient {
     }
 }
 
+/// Build a model config for `model` on `provider_name` from scratch, so
+/// canonical fields (context_limit, max_tokens, reasoning) and env-derived
+/// overrides (GOOSE_CONTEXT_LIMIT, GOOSE_MAX_TOKENS) match the overridden
+/// model, then preserve session-level state that is not model-specific from
+/// `parent`.
+fn override_model_config(
+    parent: &goose_providers::model::ModelConfig,
+    provider_name: &str,
+    model: &str,
+) -> Result<goose_providers::model::ModelConfig, anyhow::Error> {
+    if model == parent.model_name {
+        return Ok(parent.clone());
+    }
+    let mut cfg = crate::model_config::model_config_from_user_config(provider_name, model)?;
+    cfg.toolshim = parent.toolshim;
+    cfg.toolshim_model = parent.toolshim_model.clone();
+    cfg.temperature = cfg.temperature.or(parent.temperature);
+    if let Some(parent_params) = parent.request_params.clone() {
+        let merged = cfg.request_params.get_or_insert_with(Default::default);
+        for (k, v) in parent_params {
+            merged.insert(k, v);
+        }
+    }
+    Ok(cfg)
+}
+
+/// Per-subtask model routing, resolved eagerly in `prepare_swarm` so a bad
+/// model name fails the run before any subtask dispatches. `tiers` maps the
+/// abstract tier vocabulary to configs (per-run `models` param over the
+/// GOOSE_SWARM_MODEL_* config keys); `by_name` holds configs for models pinned
+/// exactly by caller-supplied plans. All models run on the swarm's provider.
+#[derive(Debug, Default)]
+struct SwarmModels {
+    tiers: HashMap<Tier, goose_providers::model::ModelConfig>,
+    by_name: HashMap<String, goose_providers::model::ModelConfig>,
+}
+
+impl SwarmModels {
+    /// `None` means "use the swarm's base model". A pinned name that was never
+    /// pre-resolved fails open to the base model — routing must not strand a
+    /// subtask the way a hard error mid-graph would.
+    fn resolve(
+        &self,
+        pinned: Option<&str>,
+        tier: Tier,
+        subtask_id: &str,
+    ) -> Option<&goose_providers::model::ModelConfig> {
+        if let Some(name) = pinned {
+            if let Some(cfg) = self.by_name.get(name) {
+                return Some(cfg);
+            }
+            warn!(
+                subtask = %subtask_id,
+                model = %name,
+                "pinned model was not pre-resolved; using the swarm's base model"
+            );
+            return None;
+        }
+        self.tiers.get(&tier)
+    }
+}
+
+/// Resolve all model routing for one swarm run up front: tier mappings (per-run
+/// `models` param first, then GOOSE_SWARM_MODEL_LIGHT/STANDARD/HEAVY config
+/// keys, tiers mapped nowhere fall through to the base model) and every model
+/// pinned by an explicit plan. A model name that fails to resolve is a
+/// caller-fixable error, raised before any subtask dispatches.
+fn resolve_swarm_models(
+    params: &SwarmExecuteParams,
+    base: &goose_providers::model::ModelConfig,
+    provider_name: &str,
+    explicit_plan: Option<&[SubTask]>,
+) -> Result<SwarmModels, String> {
+    let mut models = SwarmModels::default();
+    if let Some(map) = &params.models {
+        for key in map.keys() {
+            if Tier::parse(key).is_none() {
+                return Err(format!(
+                    "'models' keys must be light, standard, or heavy (got '{}')",
+                    key
+                ));
+            }
+        }
+    }
+    for tier in [Tier::Light, Tier::Standard, Tier::Heavy] {
+        let name = params
+            .models
+            .as_ref()
+            .and_then(|m| m.get(tier.as_str()))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                Config::global()
+                    .get_param::<String>(&format!(
+                        "GOOSE_SWARM_MODEL_{}",
+                        tier.as_str().to_ascii_uppercase()
+                    ))
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            });
+        if let Some(name) = name {
+            if name != base.model_name {
+                let cfg = override_model_config(base, provider_name, &name).map_err(|e| {
+                    format!(
+                        "Failed to resolve model '{}' for tier '{}': {}",
+                        name,
+                        tier.as_str(),
+                        e
+                    )
+                })?;
+                models.tiers.insert(tier, cfg);
+            }
+        }
+    }
+    for st in explicit_plan.into_iter().flatten() {
+        if let Some(name) = &st.model {
+            if !models.by_name.contains_key(name) {
+                let cfg = override_model_config(base, provider_name, name).map_err(|e| {
+                    format!(
+                        "Failed to resolve model '{}' for subtask {}: {}",
+                        name, st.id, e
+                    )
+                })?;
+                models.by_name.insert(name.clone(), cfg);
+            }
+        }
+    }
+    Ok(models)
+}
+
 /// [`AgentSpawner`] backed by Goose's real subagent machinery: each subtask runs
 /// as its own ephemeral subagent session via `run_subagent_task`, inheriting the
 /// parent session's provider, extensions, and working directory.
@@ -1998,6 +2154,9 @@ struct SummonAgentSpawner {
     /// Pre-resolved recipes for subtasks that run a named source, keyed by
     /// subtask id. Subtasks not in this map run as ad-hoc workers.
     source_recipes: HashMap<String, Recipe>,
+    /// Tier/pinned-model routing; subtasks it does not cover run on
+    /// `task_config.model_config`.
+    models: SwarmModels,
 }
 
 impl SummonAgentSpawner {
@@ -2137,10 +2296,25 @@ impl AgentSpawner for SummonAgentSpawner {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to create subagent session: {}", e))?;
 
+        let mut task_config = self.scoped_task_config(subtask);
+        if let Some(cfg) = self.models.resolve(
+            agent.model.as_deref().or(subtask.model.as_deref()),
+            subtask.tier,
+            &subtask.id,
+        ) {
+            info!(
+                subtask = %subtask.id,
+                tier = subtask.tier.as_str(),
+                model = %cfg.model_name,
+                "swarm model routing"
+            );
+            task_config.model_config = cfg.clone();
+        }
+
         let raw = run_subagent_task(SubagentRunParams {
             config: agent_config,
             recipe,
-            task_config: self.scoped_task_config(subtask),
+            task_config,
             return_last_only: true,
             session_id: subagent_session.id,
             cancellation_token: Some(self.cancellation_token.child_token()),
@@ -2162,8 +2336,12 @@ impl AgentSpawner for SummonAgentSpawner {
         }
     }
 
-    fn prompt_token_budget(&self) -> Option<usize> {
-        Some(usable_budget(self.task_config.model_config.context_limit()))
+    fn prompt_token_budget(&self, subtask: &SubTask) -> Option<usize> {
+        let model_config = self
+            .models
+            .resolve(subtask.model.as_deref(), subtask.tier, &subtask.id)
+            .unwrap_or(&self.task_config.model_config);
+        Some(usable_budget(model_config.context_limit()))
     }
 }
 
@@ -2895,6 +3073,120 @@ You review code."#;
                 .as_ref()
                 .and_then(|p| p.get("anthropic_beta")),
             Some(&serde_json::json!("custom-beta-header")),
+        );
+    }
+
+    fn swarm_params(models: Option<HashMap<String, String>>) -> SwarmExecuteParams {
+        SwarmExecuteParams {
+            task: "t".to_string(),
+            subtasks: None,
+            source: None,
+            parameters: None,
+            provider: None,
+            model: None,
+            models,
+            max_turns: None,
+            subtask_timeout_secs: None,
+            max_duration_secs: None,
+            max_concurrent_subtasks: None,
+            r#async: false,
+        }
+    }
+
+    const SWARM_TIER_ENV_CLEARED: [(&str, Option<&str>); 5] = [
+        ("GOOSE_CONTEXT_LIMIT", None),
+        ("GOOSE_MAX_TOKENS", None),
+        ("GOOSE_SWARM_MODEL_LIGHT", None),
+        ("GOOSE_SWARM_MODEL_STANDARD", None),
+        ("GOOSE_SWARM_MODEL_HEAVY", None),
+    ];
+
+    #[test]
+    #[serial]
+    fn test_resolve_swarm_models_param_beats_config_and_base_falls_through() {
+        let _env = env_lock::lock_env([
+            ("GOOSE_CONTEXT_LIMIT", None::<&str>),
+            ("GOOSE_MAX_TOKENS", None),
+            ("GOOSE_SWARM_MODEL_LIGHT", Some("claude-3-5-haiku-20241022")),
+            ("GOOSE_SWARM_MODEL_STANDARD", None),
+            ("GOOSE_SWARM_MODEL_HEAVY", Some(OVERRIDE_MODEL)),
+        ]);
+        let base = parent_config();
+
+        let params = swarm_params(Some(HashMap::from([(
+            "light".to_string(),
+            OVERRIDE_MODEL.to_string(),
+        )])));
+        let models = resolve_swarm_models(&params, &base, PROVIDER, None).unwrap();
+        assert_eq!(
+            models.tiers.get(&Tier::Light).unwrap().model_name,
+            OVERRIDE_MODEL,
+            "per-run models param must beat the config key"
+        );
+        assert_eq!(
+            models.tiers.get(&Tier::Heavy).unwrap().model_name,
+            OVERRIDE_MODEL,
+            "unoverridden tiers come from config"
+        );
+        assert!(
+            !models.tiers.contains_key(&Tier::Standard),
+            "unmapped tiers fall through to the base model"
+        );
+
+        // mapping a tier to the base model itself is a no-op
+        let params = swarm_params(Some(HashMap::from([(
+            "heavy".to_string(),
+            PARENT_MODEL.to_string(),
+        )])));
+        let models = resolve_swarm_models(&params, &base, PROVIDER, None).unwrap();
+        assert!(!models.tiers.contains_key(&Tier::Heavy));
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_swarm_models_rejects_unknown_tier_key() {
+        let _env = env_lock::lock_env(SWARM_TIER_ENV_CLEARED);
+        let params = swarm_params(Some(HashMap::from([(
+            "turbo".to_string(),
+            OVERRIDE_MODEL.to_string(),
+        )])));
+        let err = resolve_swarm_models(&params, &parent_config(), PROVIDER, None).unwrap_err();
+        assert!(
+            err.contains("turbo"),
+            "error should name the bad key: {err}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_swarm_models_resolves_pinned_plan_models() {
+        let _env = env_lock::lock_env(SWARM_TIER_ENV_CLEARED);
+        let base = parent_config();
+        let mut st = SubTask::new("subtask-1", "work");
+        st.model = Some(OVERRIDE_MODEL.to_string());
+        let plan = vec![st];
+
+        let models =
+            resolve_swarm_models(&swarm_params(None), &base, PROVIDER, Some(&plan)).unwrap();
+        let expected = goose_providers::model::ModelConfig::new(OVERRIDE_MODEL)
+            .with_canonical_limits(PROVIDER);
+        let pinned = models
+            .resolve(Some(OVERRIDE_MODEL), Tier::Standard, "subtask-1")
+            .expect("pinned model should resolve");
+        assert_eq!(pinned.model_name, OVERRIDE_MODEL);
+        assert_eq!(
+            pinned.context_limit, expected.context_limit,
+            "pinned model carries its own canonical limits"
+        );
+        assert!(
+            models.resolve(None, Tier::Light, "subtask-1").is_none(),
+            "no tier mapping configured — light falls through to base"
+        );
+        assert!(
+            models
+                .resolve(Some("never-resolved"), Tier::Heavy, "subtask-1")
+                .is_none(),
+            "an unresolved pinned name fails open to the base model"
         );
     }
 

@@ -38,7 +38,7 @@ impl AgentConfig {
         );
         Self {
             role,
-            model: None,
+            model: subtask.model.clone(),
             system_prompt,
         }
     }

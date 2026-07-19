@@ -318,6 +318,29 @@ prompt: |
   Verify the report shows topology=pipeline, all 3 subtasks ok, and that later
   subtasks reference their prerequisites' outputs.
 
+  ### Model/Tier Routing Test
+  Subtasks may carry a `tier` (light/standard/heavy) or an exact `model`; the
+  `models` param maps tiers to models for the run. Invalid tier keys must be
+  rejected; an unmapped tier must silently use the base model.
+
+  1. Bad routing config is a caller-fixable error (expect an error, no dispatch):
+  ```
+  swarm_execute(task: "tier probe", models: {"turbo": "some-model"}, subtasks: [{"instruction": "Say hi"}])
+  ```
+  2. Unmapped tiers fall through to the base model (expect normal success):
+  ```
+  swarm_execute(task: "tier fallthrough probe", subtasks: [{"instruction": "State which model you are, in one sentence.", "tier": "light"}])
+  ```
+  3. If a second model is reachable on this provider, map it and verify the
+  routed subtask reports the mapped model while the standard subtask reports
+  the base model:
+  ```
+  swarm_execute(task: "tier routing probe", models: {"light": "<other-model>"}, subtasks: [
+    {"instruction": "State which model you are, in one sentence.", "tier": "light"},
+    {"instruction": "State which model you are, in one sentence."}
+  ])
+  ```
+
   Log results to: {{ workspace_dir }}/phase3_delegation.md
   {% endif %}
 
@@ -407,6 +430,7 @@ prompt: |
   • Swarm (async): [✓/✗]
   • Swarm cancellation: [✓/✗]
   • Swarm parallel subtasks: [✓/✗]
+  • Swarm tier/model routing: [✓/✗]
   • Nested delegation blocked: [✓/✗]
 
   ⚠️ Issues Found:

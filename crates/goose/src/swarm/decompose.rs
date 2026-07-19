@@ -29,6 +29,52 @@ pub fn usable_budget(context_limit: usize) -> usize {
 /// Upper bound on subtasks in any plan, LLM-authored or caller-supplied.
 pub const MAX_SUBTASKS: usize = 16;
 
+/// Abstract compute class for a subtask. The planner assigns tiers, never model
+/// names — the tier→model mapping is operator configuration, so a hallucinated
+/// model name can never enter a plan. Unknown tier strings normalize to
+/// `Standard` at parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Tier {
+    Light,
+    #[default]
+    Standard,
+    Heavy,
+}
+
+impl Tier {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "light" => Some(Self::Light),
+            "standard" => Some(Self::Standard),
+            "heavy" => Some(Self::Heavy),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Light => "light",
+            Self::Standard => "standard",
+            Self::Heavy => "heavy",
+        }
+    }
+
+    pub fn is_standard(&self) -> bool {
+        *self == Self::Standard
+    }
+}
+
+/// Who authored the plan text being parsed — decides which fields are trusted.
+/// A planner LLM may only route via abstract tiers; a caller (the parent
+/// session's model or a human-authored plan) may also pin exact models, the same
+/// trust level as the tool's top-level `model` parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanTrust {
+    Planner,
+    Caller,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubTask {
     pub id: String,
@@ -62,6 +108,14 @@ pub struct SubTask {
     /// Template parameters for `source`. Ignored without a source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parameters: Option<HashMap<String, serde_json::Value>>,
+    /// Compute class this subtask needs; the integration layer maps it to a
+    /// concrete model via operator configuration.
+    #[serde(default, skip_serializing_if = "Tier::is_standard")]
+    pub tier: Tier,
+    /// Exact model for this subtask, overriding tier routing. Only survives
+    /// parsing from caller-supplied plans ([`PlanTrust::Caller`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 impl SubTask {
@@ -77,6 +131,8 @@ impl SubTask {
             required_extensions: Vec::new(),
             source: None,
             parameters: None,
+            tier: Tier::Standard,
+            model: None,
         }
     }
 }
@@ -423,6 +479,7 @@ Break the user's task into the smallest set of genuinely independent subtasks wh
   "content": "verbatim material from the task this subtask needs (optional)",
   "role": "short role label like researcher, coder, reviewer, synthesizer (optional)",
   "depends_on": [0, 2],
+  "tier": "light",
   "output_schema": {"type": "object", "properties": {"...": "..."}}
 }
 
@@ -432,6 +489,7 @@ Rules:
 - A synthesis or packaging step must depend on EVERY earlier subtask whose content it needs, not just the most recent one.
 - Prefer 1-8 subtasks. A simple task is ONE subtask — do not pad.
 - Dependencies must be acyclic.
+- "tier" is optional: "light", "standard" (the default), or "heavy" — the compute class this subtask needs. Use "light" for mechanical work (extraction, reformatting, simple lookups), "heavy" for deep reasoning, complex code, or final synthesis. Never name a concrete model; the engine maps tiers to configured models.
 - "output_schema" is optional: a JSON Schema object for the subtask's result. Use it ONLY when downstream subtasks or the user need machine-readable data (extracted fields, metrics, configuration, lists of records) — the subtask's final output is then validated against it. Omit it for prose deliverables.
 - "workspace_writes" is optional: relative file paths this subtask is expected to create or modify, when the task involves writing files. Two subtasks must never declare the same path."#;
 
@@ -527,6 +585,10 @@ struct RawPlanEntry {
     source: Option<String>,
     #[serde(default)]
     parameters: Option<HashMap<String, serde_json::Value>>,
+    #[serde(default)]
+    tier: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
 }
 
 /// Keep only sane relative paths: non-empty, not absolute, no parent traversal.
@@ -597,15 +659,18 @@ fn extract_json_array(text: &str) -> Option<&str> {
     text.get(start..=end)
 }
 
-/// Parse and validate an LLM subtask plan. Returns `None` when the plan is
+/// Parse and validate a subtask plan. Returns `None` when the plan is
 /// unusable (not a JSON array, an entry without an instruction, or a dependency
 /// cycle) so the caller can fall back to the deterministic path.
 /// `available_extensions` gates `required_extensions` entries; pass an empty
 /// slice to accept any name (the spawner still fails open against reality).
+/// `trust` decides whether per-subtask `model` entries survive: planner-authored
+/// plans may only route via tiers.
 pub fn parse_subtask_plan(
     text: &str,
     max_subtasks: usize,
     available_extensions: &[String],
+    trust: PlanTrust,
 ) -> Option<Vec<SubTask>> {
     let json = extract_json_array(text)?;
     let raw: Vec<RawPlanEntry> = serde_json::from_str(json).ok()?;
@@ -664,6 +729,41 @@ pub fn parse_subtask_plan(
                 _ => {}
             }
         }
+        let tier = match entry
+            .tier
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
+            None => Tier::Standard,
+            Some(raw) => Tier::parse(raw).unwrap_or_else(|| {
+                tracing::warn!(
+                    entry = i,
+                    tier = raw,
+                    "unknown tier in plan; using standard"
+                );
+                Tier::Standard
+            }),
+        };
+        let model = entry
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(String::from);
+        let model = match trust {
+            PlanTrust::Caller => model,
+            PlanTrust::Planner => {
+                if let Some(name) = &model {
+                    tracing::warn!(
+                        entry = i,
+                        model = %name,
+                        "dropping planner-authored model from plan; planners route via tiers"
+                    );
+                }
+                None
+            }
+        };
         subtasks.push(SubTask {
             id: ids[i].clone(),
             instruction,
@@ -675,6 +775,8 @@ pub fn parse_subtask_plan(
             required_extensions: known_extensions(&entry.required_extensions, available_extensions),
             source,
             parameters,
+            tier,
+            model,
         });
     }
 
@@ -702,6 +804,7 @@ impl Decomposer for SemanticDecomposer {
                 &message.as_concat_text(),
                 self.max_subtasks,
                 &self.available_extensions,
+                PlanTrust::Planner,
             ),
             Err(e) => {
                 tracing::warn!(
