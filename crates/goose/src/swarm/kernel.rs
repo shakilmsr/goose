@@ -8,14 +8,19 @@
 //! dependent receives only its direct prerequisites' outputs — never whole
 //! transcripts — which is what keeps multi-legged runs free of token bloat.
 //!
-//! v1 scope (same as SwarmOS): siblings dispatch sequentially, in event order.
-//! Correct independence and joins are the goal here, not wall-clock parallelism.
+//! Independent siblings dispatch concurrently, bounded by
+//! [`Kernel::with_max_concurrency`] (default 1 — sequential, in event order —
+//! so parallelism is an explicit opt-in). Each in-flight node publishes its
+//! success or failure event before its task completes, so the loop can always
+//! re-drain the bus after a join and the run is over exactly when the bus is
+//! drained, nothing is ready, and nothing is in flight.
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
+use tokio::task::JoinSet;
 
 use crate::swarm::decompose::{sink_ids, Decomposer, SubTask};
 use crate::swarm::roster::{AgentConfig, Roster};
@@ -181,6 +186,7 @@ pub struct Kernel {
     spawner: Arc<dyn AgentSpawner>,
     roster: Roster,
     max_retries: usize,
+    max_concurrency: usize,
     subtask_timeout: Option<std::time::Duration>,
     max_run_duration: Option<std::time::Duration>,
 }
@@ -197,6 +203,7 @@ impl Kernel {
             spawner,
             roster,
             max_retries: 2,
+            max_concurrency: 1,
             subtask_timeout: None,
             max_run_duration: None,
         }
@@ -204,6 +211,16 @@ impl Kernel {
 
     pub fn with_max_retries(mut self, max_retries: usize) -> Self {
         self.max_retries = max_retries;
+        self
+    }
+
+    /// How many independent subtasks may run at once. 1 (the default) preserves
+    /// strict sequential event-order dispatch; higher values let siblings whose
+    /// dependencies are all satisfied run in parallel. Join semantics are
+    /// unaffected — a join still fires exactly once, after all its
+    /// prerequisites' completion events.
+    pub fn with_max_concurrency(mut self, max_concurrency: usize) -> Self {
+        self.max_concurrency = max_concurrency.max(1);
         self
     }
 
@@ -224,8 +241,10 @@ impl Kernel {
     }
 
     /// Decompose the task, plan the topology, and walk the event graph to
-    /// completion. Because dispatch is sequential and every event is published
-    /// inline, a drained bus means the run is over — no timeouts needed.
+    /// completion. Every in-flight node publishes its terminal event before its
+    /// task finishes, so after each completion the bus is re-drained; the run is
+    /// over when the bus is empty, nothing is ready, and nothing is in flight —
+    /// no timeouts needed.
     pub async fn run(&mut self, task: &str, decomposer: &dyn Decomposer) -> Result<SwarmReport> {
         let subtasks = decomposer.decompose(task).await?;
         if subtasks.is_empty() {
@@ -245,7 +264,9 @@ impl Kernel {
         }
 
         let mut join_counts: HashMap<usize, usize> = HashMap::new();
-        let mut dispatched: HashMap<usize, bool> = HashMap::new();
+        let mut dispatched = vec![false; nodes.len()];
+        let mut ready: VecDeque<usize> = VecDeque::new();
+        let mut in_flight: JoinSet<Option<NodeFailure>> = JoinSet::new();
         let mut failures: Vec<NodeFailure> = Vec::new();
         let mut dispatches = 0usize;
         let mut halted: Option<String> = None;
@@ -254,28 +275,37 @@ impl Kernel {
         self.event_bus
             .publish(ENTRY_EVENT, serde_json::json!({ "prompt": task }));
 
-        'run: while let Ok(event) = self.event_bus.receiver.try_recv() {
-            let Some(triggered) = trigger_map.get(event.name.as_str()) else {
-                continue; // terminal event — no downstream node
-            };
-            for &idx in triggered {
-                let node = &nodes[idx];
-                if node.join_after > 1 {
-                    let count = join_counts.entry(idx).or_insert(0);
-                    *count += 1;
-                    if *count < node.join_after {
-                        tracing::debug!(
-                            node = %node.id,
-                            "join barrier waiting: {}/{}",
-                            count,
-                            node.join_after
-                        );
+        loop {
+            while let Ok(event) = self.event_bus.receiver.try_recv() {
+                let Some(triggered) = trigger_map.get(event.name.as_str()) else {
+                    continue; // terminal event — no downstream node
+                };
+                for &idx in triggered {
+                    let node = &nodes[idx];
+                    if node.join_after > 1 {
+                        let count = join_counts.entry(idx).or_insert(0);
+                        *count += 1;
+                        if *count < node.join_after {
+                            tracing::debug!(
+                                node = %node.id,
+                                "join barrier waiting: {}/{}",
+                                count,
+                                node.join_after
+                            );
+                            continue;
+                        }
+                    }
+                    if std::mem::replace(&mut dispatched[idx], true) {
                         continue;
                     }
+                    ready.push_back(idx);
                 }
-                if std::mem::replace(dispatched.entry(idx).or_insert(false), true) {
-                    continue;
-                }
+            }
+
+            while halted.is_none() && in_flight.len() < self.max_concurrency {
+                let Some(idx) = ready.pop_front() else {
+                    break;
+                };
                 if let Some(max) = self.max_run_duration {
                     if run_start.elapsed() > max {
                         let reason = format!(
@@ -285,15 +315,40 @@ impl Kernel {
                         );
                         tracing::warn!("{reason}");
                         halted = Some(reason);
-                        break 'run;
+                        ready.clear();
+                        break;
                     }
                 }
                 dispatches += 1;
+                let node = &nodes[idx];
                 let subtask = subtask_by_id
                     .get(node.subtask_id.as_str())
                     .copied()
                     .ok_or_else(|| anyhow!("node '{}' references unknown subtask", node.id))?;
-                self.dispatch(node, subtask, &mut failures).await;
+                in_flight.spawn(
+                    NodeDispatch {
+                        spawner: Arc::clone(&self.spawner),
+                        scratch_pad: self.scratch_pad.clone(),
+                        events: self.event_bus.sender.clone(),
+                        max_retries: self.max_retries,
+                        subtask_timeout: self.subtask_timeout,
+                        node: node.clone(),
+                        subtask: subtask.clone(),
+                        agent: self.roster.resolve(subtask),
+                    }
+                    .run(),
+                );
+            }
+
+            if in_flight.is_empty() {
+                break;
+            }
+            if let Some(joined) = in_flight.join_next().await {
+                match joined {
+                    Ok(Some(failure)) => failures.push(failure),
+                    Ok(None) => {}
+                    Err(e) => tracing::error!("swarm dispatch task aborted: {e}"),
+                }
             }
         }
 
@@ -325,106 +380,6 @@ impl Kernel {
         })
     }
 
-    async fn dispatch(
-        &self,
-        node: &WorkflowNode,
-        subtask: &SubTask,
-        failures: &mut Vec<NodeFailure>,
-    ) {
-        let agent = self.roster.resolve(subtask);
-        let mut dependency_context = self.gather_dependency_context(subtask).await;
-        if let Some(budget) = self.spawner.prompt_token_budget() {
-            dependency_context = fit_dependency_context(subtask, dependency_context, budget).await;
-        }
-        let mut last_error = String::new();
-
-        for attempt in 0..=self.max_retries {
-            tracing::info!(
-                node = %node.id,
-                subtask = %subtask.id,
-                role = %agent.role,
-                attempt = attempt + 1,
-                "swarm dispatch"
-            );
-            let attempt_result = {
-                let fut = self
-                    .spawner
-                    .run_subtask(subtask, &agent, &dependency_context);
-                match self.subtask_timeout {
-                    Some(limit) => match tokio::time::timeout(limit, fut).await {
-                        Ok(result) => result,
-                        Err(_) => Err(anyhow!("subtask timed out after {:.0?}", limit)),
-                    },
-                    None => fut.await,
-                }
-            };
-            match attempt_result {
-                Ok(result) => {
-                    self.scratch_pad
-                        .set(subtask.id.clone(), serde_json::Value::String(result.output))
-                        .await;
-                    if !result.artifacts.is_empty() {
-                        self.scratch_pad
-                            .set(
-                                artifacts_key(&subtask.id),
-                                serde_json::json!(result.artifacts),
-                            )
-                            .await;
-                    }
-                    self.event_bus.publish(
-                        node.publishes_on_success.clone(),
-                        serde_json::json!({ "subtask_id": subtask.id }),
-                    );
-                    return;
-                }
-                Err(e) => {
-                    last_error = e.to_string();
-                    tracing::warn!(
-                        node = %node.id,
-                        subtask = %subtask.id,
-                        "subtask attempt {} failed: {}",
-                        attempt + 1,
-                        last_error
-                    );
-                }
-            }
-        }
-
-        failures.push(NodeFailure {
-            subtask_id: subtask.id.clone(),
-            attempts: self.max_retries + 1,
-            error: last_error,
-        });
-        self.event_bus.publish(
-            node.publishes_on_failure.clone(),
-            serde_json::json!({ "subtask_id": subtask.id }),
-        );
-    }
-
-    async fn gather_dependency_context(&self, subtask: &SubTask) -> String {
-        let mut sections = Vec::new();
-        for dep in &subtask.dependencies {
-            if let Some(serde_json::Value::String(out)) = self.scratch_pad.get(dep).await {
-                sections.push(format!("### Output of {dep}\n{out}"));
-            }
-            if let Some(value) = self.scratch_pad.get(&artifacts_key(dep)).await {
-                if let Ok(paths) = serde_json::from_value::<Vec<String>>(value) {
-                    if !paths.is_empty() {
-                        sections.push(format!(
-                            "### Artifact files from {dep} (read them from disk as needed)\n{}",
-                            paths
-                                .iter()
-                                .map(|p| format!("- {p}"))
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        ));
-                    }
-                }
-            }
-        }
-        sections.join("\n\n")
-    }
-
     fn collect_final_output(
         &self,
         subtasks: &[SubTask],
@@ -445,4 +400,120 @@ impl Kernel {
                 .join("\n\n"),
         }
     }
+}
+
+/// One node's dispatch, owned so it can run as a spawned task alongside its
+/// siblings. Publishes the node's success or failure event before completing —
+/// the kernel's termination invariant depends on that ordering.
+struct NodeDispatch {
+    spawner: Arc<dyn AgentSpawner>,
+    scratch_pad: ScratchPad,
+    events: mpsc::UnboundedSender<Event>,
+    max_retries: usize,
+    subtask_timeout: Option<std::time::Duration>,
+    node: WorkflowNode,
+    subtask: SubTask,
+    agent: AgentConfig,
+}
+
+impl NodeDispatch {
+    async fn run(self) -> Option<NodeFailure> {
+        let mut dependency_context =
+            gather_dependency_context(&self.scratch_pad, &self.subtask).await;
+        if let Some(budget) = self.spawner.prompt_token_budget() {
+            dependency_context =
+                fit_dependency_context(&self.subtask, dependency_context, budget).await;
+        }
+        let mut last_error = String::new();
+
+        for attempt in 0..=self.max_retries {
+            tracing::info!(
+                node = %self.node.id,
+                subtask = %self.subtask.id,
+                role = %self.agent.role,
+                attempt = attempt + 1,
+                "swarm dispatch"
+            );
+            let attempt_result = {
+                let fut = self
+                    .spawner
+                    .run_subtask(&self.subtask, &self.agent, &dependency_context);
+                match self.subtask_timeout {
+                    Some(limit) => match tokio::time::timeout(limit, fut).await {
+                        Ok(result) => result,
+                        Err(_) => Err(anyhow!("subtask timed out after {:.0?}", limit)),
+                    },
+                    None => fut.await,
+                }
+            };
+            match attempt_result {
+                Ok(result) => {
+                    self.scratch_pad
+                        .set(
+                            self.subtask.id.clone(),
+                            serde_json::Value::String(result.output),
+                        )
+                        .await;
+                    if !result.artifacts.is_empty() {
+                        self.scratch_pad
+                            .set(
+                                artifacts_key(&self.subtask.id),
+                                serde_json::json!(result.artifacts),
+                            )
+                            .await;
+                    }
+                    self.publish(&self.node.publishes_on_success);
+                    return None;
+                }
+                Err(e) => {
+                    last_error = e.to_string();
+                    tracing::warn!(
+                        node = %self.node.id,
+                        subtask = %self.subtask.id,
+                        "subtask attempt {} failed: {}",
+                        attempt + 1,
+                        last_error
+                    );
+                }
+            }
+        }
+
+        self.publish(&self.node.publishes_on_failure);
+        Some(NodeFailure {
+            subtask_id: self.subtask.id.clone(),
+            attempts: self.max_retries + 1,
+            error: last_error,
+        })
+    }
+
+    fn publish(&self, event_name: &str) {
+        let _ = self.events.send(Event {
+            name: event_name.to_string(),
+            payload: serde_json::json!({ "subtask_id": self.subtask.id }),
+        });
+    }
+}
+
+async fn gather_dependency_context(scratch_pad: &ScratchPad, subtask: &SubTask) -> String {
+    let mut sections = Vec::new();
+    for dep in &subtask.dependencies {
+        if let Some(serde_json::Value::String(out)) = scratch_pad.get(dep).await {
+            sections.push(format!("### Output of {dep}\n{out}"));
+        }
+        if let Some(value) = scratch_pad.get(&artifacts_key(dep)).await {
+            if let Ok(paths) = serde_json::from_value::<Vec<String>>(value) {
+                if !paths.is_empty() {
+                    sections.push(format!(
+                        "### Artifact files from {dep} (read them from disk as needed)\n{}",
+                        paths
+                            .iter()
+                            .map(|p| format!("- {p}"))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    ));
+                }
+            }
+        }
+    }
+    sections.join("\n\n")
 }

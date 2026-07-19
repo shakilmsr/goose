@@ -95,6 +95,18 @@ fn is_clean_fan_out_join(subtasks: &[SubTask]) -> bool {
         .any(|s| s.dependencies.iter().any(|d| d == &join.id))
 }
 
+/// True only for a strict chain in slice order: the first subtask is a root and
+/// each subsequent one depends exactly on its predecessor. A looser test (all
+/// dependency counts <= 1) would also match independent sets and stars — shapes
+/// whose siblings can run in parallel and must not be serialized by the
+/// pipeline planner, which would additionally chain unrelated failures.
+fn is_chain(subtasks: &[SubTask]) -> bool {
+    subtasks.iter().enumerate().all(|(i, st)| match i {
+        0 => st.dependencies.is_empty(),
+        _ => st.dependencies.len() == 1 && st.dependencies[0] == subtasks[i - 1].id,
+    })
+}
+
 /// Infer the topology from the actual dependency graph — the most authoritative
 /// signal available (port of `_shape_from_decomposition`).
 pub fn select_topology(subtasks: &[SubTask]) -> TopologyType {
@@ -104,7 +116,7 @@ pub fn select_topology(subtasks: &[SubTask]) -> TopologyType {
     if is_clean_fan_out_join(subtasks) {
         return TopologyType::FanOutJoin;
     }
-    if subtasks.iter().all(|s| s.dependencies.len() <= 1) {
+    if is_chain(subtasks) {
         return TopologyType::Pipeline;
     }
     TopologyType::Dag
@@ -114,8 +126,9 @@ pub trait TopologyExecutor: Send + Sync {
     fn plan(&self, subtasks: &[SubTask]) -> Result<Vec<WorkflowNode>>;
 }
 
-/// Strict sequential chain in slice order. Declared dependencies are subsumed:
-/// selection only routes here when the graph is a chain (or a single subtask).
+/// Strict sequential chain in slice order. Selection only routes here when the
+/// graph really is a chain (or a single subtask), so the implied stage edges
+/// coincide with the declared dependencies.
 pub struct PipelineExecutor;
 
 impl TopologyExecutor for PipelineExecutor {

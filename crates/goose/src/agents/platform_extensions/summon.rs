@@ -81,6 +81,8 @@ pub struct SwarmExecuteParams {
     pub subtask_timeout_secs: Option<u64>,
     #[serde(default)]
     pub max_duration_secs: Option<u64>,
+    #[serde(default)]
+    pub max_concurrent_subtasks: Option<usize>,
 }
 
 pub struct BackgroundTask {
@@ -668,6 +670,11 @@ impl SummonClient {
                     "type": "integer",
                     "minimum": 1,
                     "description": "Wall-clock circuit breaker for the whole swarm run; when exceeded, no further subtasks dispatch."
+                },
+                "max_concurrent_subtasks": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "How many independent subtasks may run at once (default: GOOSE_MAX_BACKGROUND_TASKS, 5). Use 1 to force sequential dispatch."
                 }
             }
         });
@@ -705,6 +712,11 @@ impl SummonClient {
         if let Some(max) = params.max_turns {
             if max < 1 {
                 return Err("'max_turns' must be at least 1".to_string());
+            }
+        }
+        if let Some(max) = params.max_concurrent_subtasks {
+            if max < 1 {
+                return Err("'max_concurrent_subtasks' must be at least 1".to_string());
             }
         }
 
@@ -763,7 +775,11 @@ impl SummonClient {
             workspace_root,
         });
 
-        let mut kernel = Kernel::new(spawner);
+        let mut kernel = Kernel::new(spawner).with_max_concurrency(
+            params
+                .max_concurrent_subtasks
+                .unwrap_or_else(max_background_tasks),
+        );
         if let Some(secs) = params.subtask_timeout_secs {
             kernel = kernel.with_subtask_timeout(Duration::from_secs(secs));
         }

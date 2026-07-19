@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -40,6 +41,13 @@ struct FakeSpawner {
     artifacts_for: HashMap<String, Vec<String>>,
     delay: Option<Duration>,
     budget: Option<usize>,
+    /// Rendezvous points keyed by subtask id: a participating subtask blocks
+    /// until the barrier's full party is inside `run_subtask` simultaneously.
+    /// Proves real overlap without sleeping — a kernel that under-dispatches
+    /// deadlocks here (converted to a failure by the test's timeout wrapper).
+    barriers: HashMap<String, Arc<tokio::sync::Barrier>>,
+    in_flight: AtomicUsize,
+    max_in_flight: AtomicUsize,
 }
 
 impl FakeSpawner {
@@ -51,6 +59,9 @@ impl FakeSpawner {
             artifacts_for: HashMap::new(),
             delay: None,
             budget: None,
+            barriers: HashMap::new(),
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
         }
     }
 
@@ -73,10 +84,22 @@ impl AgentSpawner for FakeSpawner {
         _agent: &AgentConfig,
         dependency_context: &str,
     ) -> Result<SubtaskResult> {
+        struct InFlightGuard<'a>(&'a AtomicUsize);
+        impl Drop for InFlightGuard<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+        let _guard = InFlightGuard(&self.in_flight);
         self.calls
             .lock()
             .await
             .push((st.id.clone(), dependency_context.to_string()));
+        if let Some(barrier) = self.barriers.get(&st.id) {
+            barrier.wait().await;
+        }
         if let Some(delay) = self.delay {
             tokio::time::sleep(delay).await;
         }
@@ -198,6 +221,17 @@ fn select_topology_from_graph_shape() {
         select_topology(&[subtask("only", &[])]),
         TopologyType::Pipeline
     );
+
+    // independent sets and stars have sparse deps but are NOT chains — routing
+    // them to the pipeline planner would serialize parallelizable siblings
+    let independent = vec![subtask("a", &[]), subtask("b", &[]), subtask("c", &[])];
+    assert_eq!(select_topology(&independent), TopologyType::Dag);
+    let star = vec![
+        subtask("a", &[]),
+        subtask("b", &["a"]),
+        subtask("c", &["a"]),
+    ];
+    assert_eq!(select_topology(&star), TopologyType::Dag);
 }
 
 #[test]
@@ -288,6 +322,141 @@ async fn kernel_reports_exhausted_failure_and_blocks_downstream() {
     assert!(report.final_output.is_empty());
     // b never dispatched: its trigger event never fired
     assert_eq!(spawner.calls.lock().await.len(), 2);
+}
+
+// ── concurrent dispatch ──────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn kernel_concurrent_siblings_overlap_and_join_once() {
+    let subtasks = vec![
+        subtask("a", &[]),
+        subtask("b", &[]),
+        subtask("c", &[]),
+        subtask("join", &["a", "b", "c"]),
+    ];
+    let mut spawner = FakeSpawner::new();
+    let rendezvous = Arc::new(tokio::sync::Barrier::new(3));
+    for id in ["a", "b", "c"] {
+        spawner.barriers.insert(id.to_string(), rendezvous.clone());
+    }
+    let spawner = Arc::new(spawner);
+    let mut kernel = Kernel::new(spawner.clone()).with_max_concurrency(3);
+    let report = tokio::time::timeout(
+        Duration::from_secs(30),
+        kernel.run("fanout", &StaticDecomposer(subtasks)),
+    )
+    .await
+    .expect("kernel under-dispatched: roots never met at the rendezvous barrier")
+    .unwrap();
+
+    assert!(report.failures.is_empty());
+    assert_eq!(report.dispatches, 4, "join must fire exactly once");
+    assert_eq!(
+        spawner.max_in_flight.load(Ordering::SeqCst),
+        3,
+        "all three independent roots must run simultaneously"
+    );
+    let calls = spawner.calls.lock().await;
+    assert_eq!(calls.last().unwrap().0, "join", "join runs after all roots");
+    let (_, join_context) = calls.iter().find(|(id, _)| id == "join").unwrap();
+    for dep in ["a", "b", "c"] {
+        assert!(join_context.contains(&format!("output of {dep}")));
+    }
+    assert_eq!(report.final_output, "output of join");
+}
+
+#[tokio::test]
+async fn kernel_concurrency_cap_bounds_in_flight() {
+    let subtasks = vec![
+        subtask("a", &[]),
+        subtask("b", &[]),
+        subtask("c", &[]),
+        subtask("d", &[]),
+    ];
+    let mut spawner = FakeSpawner::new();
+    // Party of 2 across four subtasks: under a cap of 2 they can only clear the
+    // barrier pairwise, so the run completing at all proves pairwise overlap.
+    let rendezvous = Arc::new(tokio::sync::Barrier::new(2));
+    for id in ["a", "b", "c", "d"] {
+        spawner.barriers.insert(id.to_string(), rendezvous.clone());
+    }
+    let spawner = Arc::new(spawner);
+    let mut kernel = Kernel::new(spawner.clone()).with_max_concurrency(2);
+    let report = tokio::time::timeout(
+        Duration::from_secs(30),
+        kernel.run("capped", &StaticDecomposer(subtasks)),
+    )
+    .await
+    .expect("kernel under-dispatched: siblings never met at the rendezvous barrier")
+    .unwrap();
+
+    assert_eq!(
+        report.topology,
+        TopologyType::Dag,
+        "independent set must not be misclassified as a pipeline"
+    );
+    assert_eq!(report.outputs.len(), 4);
+    let max = spawner.max_in_flight.load(Ordering::SeqCst);
+    assert!(max <= 2, "cap of 2 exceeded: {max} in flight");
+    assert!(max >= 2, "siblings never overlapped under a cap of 2");
+}
+
+#[tokio::test]
+async fn kernel_concurrent_diamond_keeps_dependency_order() {
+    let subtasks = vec![
+        subtask("a", &[]),
+        subtask("b", &["a"]),
+        subtask("c", &["a"]),
+        subtask("d", &["b", "c"]),
+    ];
+    let mut spawner = FakeSpawner::new();
+    spawner.delay = Some(Duration::from_millis(10));
+    let spawner = Arc::new(spawner);
+    let mut kernel = Kernel::new(spawner.clone()).with_max_concurrency(4);
+    let report = kernel
+        .run("diamond", &StaticDecomposer(subtasks))
+        .await
+        .unwrap();
+
+    assert!(report.failures.is_empty());
+    assert_eq!(report.dispatches, 4);
+    let calls = spawner.calls.lock().await;
+    let order: Vec<&str> = calls.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(order.len(), 4);
+    assert_eq!(order[0], "a", "root must run before its dependents");
+    assert_eq!(order[3], "d", "join must run after both branches");
+    let (_, d_context) = calls.iter().find(|(id, _)| id == "d").unwrap();
+    assert!(d_context.contains("output of b") && d_context.contains("output of c"));
+    assert_eq!(report.final_output, "output of d");
+}
+
+#[tokio::test]
+async fn kernel_concurrent_sibling_failure_blocks_join_and_terminates() {
+    let subtasks = vec![
+        subtask("a", &[]),
+        subtask("b", &[]),
+        subtask("join", &["a", "b"]),
+    ];
+    let mut spawner = FakeSpawner::failing("b", usize::MAX);
+    spawner.delay = Some(Duration::from_millis(10));
+    let spawner = Arc::new(spawner);
+    let mut kernel = Kernel::new(spawner.clone())
+        .with_max_retries(1)
+        .with_max_concurrency(2);
+    let report = kernel
+        .run("partial failure", &StaticDecomposer(subtasks))
+        .await
+        .unwrap();
+
+    assert_eq!(report.failures.len(), 1);
+    assert_eq!(report.failures[0].subtask_id, "b");
+    assert_eq!(report.outputs.len(), 1, "only a completes");
+    assert!(report.final_output.is_empty(), "join never produced output");
+    let calls = spawner.calls.lock().await;
+    assert!(
+        !calls.iter().any(|(id, _)| id == "join"),
+        "join must not dispatch with a failed prerequisite"
+    );
 }
 
 // ── token budgeting ──────────────────────────────────────────────────────────
