@@ -85,6 +85,7 @@ instructions: |
   - swarm_execute with an explicit single-subtask plan (synchronous delegation)
   - swarm_execute for asynchronous background runs
   - Parallel subtask execution inside one swarm
+  - Review-loop topology (worker + critic verdict gate)
   - Nested delegation prevention (critical security test)
 
   ### Phase 4: Advanced Self-Testing
@@ -340,6 +341,39 @@ prompt: |
     {"instruction": "State which model you are, in one sentence."}
   ])
   ```
+
+  ### Review-Loop Test
+  A review loop pairs a worker with a critic that returns an accept/revise verdict;
+  on "revise" the worker re-runs with the critic's feedback until it passes or
+  `max_revisions` is reached. Downstream reads the worker's *accepted* output, never
+  the verdict.
+
+  1. The `review: true` convenience wraps `task` in a worker+critic loop. Give the
+  worker a task with a checkable defect so the critic has something to catch:
+  ```
+  swarm_execute(task: "Write a one-paragraph note stating that 2 + 2 = 5, then present it as final.", review: true, max_revisions: 2)
+  ```
+  Verify the report shows topology=review_loop and that the final output was
+  corrected (or, if the critic never accepted, a "Review loop: ... exhausted" note
+  is present and the last draft still shipped).
+
+  2. `review` cannot be combined with `subtasks` or `source` (expect an error, no
+  dispatch):
+  ```
+  swarm_execute(task: "x", review: true, subtasks: [{"instruction": "y"}])
+  ```
+
+  3. A review loop inside a larger plan: declare a critic with a `reviews` index and
+  a downstream step depending on the worker.
+  ```
+  swarm_execute(task: "Draft then verify then package", subtasks: [
+    {"instruction": "Write a short factual claim about the number of days in a leap year."},
+    {"instruction": "Verify the worker's claim is correct; accept only if accurate.", "reviews": 0, "max_revisions": 2},
+    {"instruction": "Wrap the accepted claim in a one-line summary.", "depends_on": [0]}
+  ])
+  ```
+  Verify the packaging step ran once, after the loop converged, and referenced the
+  worker's accepted output.
 
   Log results to: {{ workspace_dir }}/phase3_delegation.md
   {% endif %}

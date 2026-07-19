@@ -64,6 +64,109 @@ pub enum SubtaskOutcome {
     Failed(String),
 }
 
+/// A critic's routing decision in a review loop. `Revise` carries the feedback the
+/// worker should address on its next pass.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Verdict {
+    Accept,
+    Revise(String),
+}
+
+/// The critic envelope: a review-loop critic returns an accept/revise verdict plus
+/// actionable feedback instead of the plain worker envelope. `status` is retained
+/// so a critic that genuinely could not perform the review still fails the node
+/// (via the normal Tier-1 path) rather than being read as a verdict.
+pub fn critic_envelope_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "required": ["status", "verdict"],
+        "properties": {
+            "status": {
+                "type": "string",
+                "enum": ["success", "failed"],
+                "description": "Whether you were able to perform the review at all. Report 'failed' only if you could not evaluate the work; a completed review that finds problems is still 'success' with verdict 'revise'."
+            },
+            "verdict": {
+                "type": "string",
+                "enum": ["accept", "revise"],
+                "description": "'accept' if the worker's output meets the task's requirements; 'revise' if it must be corrected and re-run."
+            },
+            "feedback": {
+                "type": "string",
+                "description": "On 'revise', the specific, actionable corrections the worker must make. Required when revising; the worker sees only this text."
+            },
+            "assessment": {
+                "type": "string",
+                "description": "Brief reasoning for the verdict."
+            }
+        }
+    })
+}
+
+#[derive(Deserialize)]
+struct RawCriticEnvelope {
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    verdict: String,
+    #[serde(default)]
+    feedback: String,
+    #[serde(default)]
+    assessment: String,
+}
+
+/// Interpret a critic subagent's raw output into a node outcome plus a verdict. A
+/// `status=failed` envelope means the critic could not review — the node fails and
+/// carries no verdict (the loop stalls, surfacing a broken critic). Otherwise the
+/// `verdict` field routes the loop: `revise` carries the feedback, `accept`
+/// proceeds. Anything unparseable degrades to `accept` (fail-open toward
+/// termination — defaulting to revise would burn revision cycles, and the loop is
+/// bounded regardless), preserving the raw text as the outcome.
+pub fn interpret_critic_output(raw: &str) -> (SubtaskOutcome, Option<Verdict>) {
+    match serde_json::from_str::<RawCriticEnvelope>(raw.trim()) {
+        Ok(env) if env.status == "failed" => {
+            let reason = if env.assessment.is_empty() {
+                "critic reported it could not perform the review".to_string()
+            } else {
+                env.assessment
+            };
+            (SubtaskOutcome::Failed(reason), None)
+        }
+        Ok(env) if env.verdict == "revise" => {
+            let feedback = if env.feedback.is_empty() {
+                if env.assessment.is_empty() {
+                    "the reviewer requested revisions but gave no specifics".to_string()
+                } else {
+                    env.assessment.clone()
+                }
+            } else {
+                env.feedback
+            };
+            let summary = if env.assessment.is_empty() {
+                "revise".to_string()
+            } else {
+                env.assessment
+            };
+            (
+                SubtaskOutcome::Success(summary),
+                Some(Verdict::Revise(feedback)),
+            )
+        }
+        Ok(env) if env.verdict == "accept" => {
+            let summary = if env.assessment.is_empty() {
+                "accept".to_string()
+            } else {
+                env.assessment
+            };
+            (SubtaskOutcome::Success(summary), Some(Verdict::Accept))
+        }
+        _ => (
+            SubtaskOutcome::Success(raw.to_string()),
+            Some(Verdict::Accept),
+        ),
+    }
+}
+
 #[derive(Deserialize)]
 struct RawEnvelope {
     status: String,

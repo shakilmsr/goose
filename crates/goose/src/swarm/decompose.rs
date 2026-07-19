@@ -29,6 +29,19 @@ pub fn usable_budget(context_limit: usize) -> usize {
 /// Upper bound on subtasks in any plan, LLM-authored or caller-supplied.
 pub const MAX_SUBTASKS: usize = 16;
 
+/// Default revision cap for a review loop when a critic subtask does not set its
+/// own `max_revisions`. Bounds how many times a worker is re-run on a "revise"
+/// verdict before the loop accepts-by-exhaustion.
+pub const DEFAULT_MAX_REVISIONS: usize = 2;
+
+fn default_max_revisions() -> usize {
+    DEFAULT_MAX_REVISIONS
+}
+
+fn is_default_max_revisions(value: &usize) -> bool {
+    *value == DEFAULT_MAX_REVISIONS
+}
+
 /// Abstract compute class for a subtask. The planner assigns tiers, never model
 /// names — the tier→model mapping is operator configuration, so a hallucinated
 /// model name can never enter a plan. Unknown tier strings normalize to
@@ -116,6 +129,20 @@ pub struct SubTask {
     /// parsing from caller-supplied plans ([`PlanTrust::Caller`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// When set, this subtask is a *critic* in a review loop: it judges the named
+    /// worker subtask's output and returns an accept/revise verdict. The named
+    /// worker is also added to `dependencies` (the critic reads the draft), while
+    /// the loop-back edge (worker re-run on "revise") lives in the topology, not
+    /// here — so the base dependency graph stays acyclic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviews: Option<String>,
+    /// Revision cap for the loop this critic governs. Only meaningful when
+    /// `reviews` is set.
+    #[serde(
+        default = "default_max_revisions",
+        skip_serializing_if = "is_default_max_revisions"
+    )]
+    pub max_revisions: usize,
 }
 
 impl SubTask {
@@ -133,7 +160,14 @@ impl SubTask {
             parameters: None,
             tier: Tier::Standard,
             model: None,
+            reviews: None,
+            max_revisions: DEFAULT_MAX_REVISIONS,
         }
+    }
+
+    /// Whether this subtask is a critic in a review loop.
+    pub fn is_critic(&self) -> bool {
+        self.reviews.is_some()
     }
 }
 
@@ -480,7 +514,9 @@ Break the user's task into the smallest set of genuinely independent subtasks wh
   "role": "short role label like researcher, coder, reviewer, synthesizer (optional)",
   "depends_on": [0, 2],
   "tier": "light",
-  "output_schema": {"type": "object", "properties": {"...": "..."}}
+  "output_schema": {"type": "object", "properties": {"...": "..."}},
+  "reviews": 0,
+  "max_revisions": 2
 }
 
 Rules:
@@ -491,7 +527,8 @@ Rules:
 - Dependencies must be acyclic.
 - "tier" is optional: "light", "standard" (the default), or "heavy" — the compute class this subtask needs. Use "light" for mechanical work (extraction, reformatting, simple lookups), "heavy" for deep reasoning, complex code, or final synthesis. Never name a concrete model; the engine maps tiers to configured models.
 - "output_schema" is optional: a JSON Schema object for the subtask's result. Use it ONLY when downstream subtasks or the user need machine-readable data (extracted fields, metrics, configuration, lists of records) — the subtask's final output is then validated against it. Omit it for prose deliverables.
-- "workspace_writes" is optional: relative file paths this subtask is expected to create or modify, when the task involves writing files. Two subtasks must never declare the same path."#;
+- "workspace_writes" is optional: relative file paths this subtask is expected to create or modify, when the task involves writing files. Two subtasks must never declare the same path.
+- "reviews" is optional: use it ONLY for a review loop where quality, correctness, or verification matters. Add a dedicated critic subtask whose "reviews" is the zero-based index of the worker subtask to judge; the critic returns an accept-or-revise verdict and, on "revise", the worker re-runs with the critic's feedback until it passes or "max_revisions" is reached. A critic must review exactly one worker, must not review another critic, and should NOT itself do the work. Downstream steps depend on the WORKER (its accepted output), not the critic. "max_revisions" (default 2) caps the revision cycles."#;
 
 fn decomposer_system_prompt(
     subtask_budget: Option<usize>,
@@ -589,6 +626,10 @@ struct RawPlanEntry {
     tier: Option<String>,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    reviews: Option<serde_json::Value>,
+    #[serde(default)]
+    max_revisions: Option<usize>,
 }
 
 /// Keep only sane relative paths: non-empty, not absolute, no parent traversal.
@@ -729,6 +770,26 @@ pub fn parse_subtask_plan(
                 _ => {}
             }
         }
+        let reviews = entry.reviews.as_ref().and_then(|val| match val {
+            serde_json::Value::Number(n) => n.as_u64().and_then(|idx| {
+                let idx = idx as usize;
+                (idx < raw.len() && idx != i).then(|| ids[idx].clone())
+            }),
+            serde_json::Value::String(s) => {
+                (id_set.contains(s.as_str()) && s != &ids[i]).then(|| s.clone())
+            }
+            _ => None,
+        });
+        if entry.reviews.is_some() && reviews.is_none() {
+            tracing::warn!(entry = i, "dropping invalid 'reviews' target from plan");
+        }
+        // A critic reads its worker's draft, so the review target is also a
+        // dependency (a forward critic->worker edge — the loop-back edge lives in
+        // the topology, keeping this base graph acyclic).
+        if let Some(target) = &reviews {
+            push_dep(&mut deps, target.clone());
+        }
+        let max_revisions = entry.max_revisions.unwrap_or(DEFAULT_MAX_REVISIONS);
         let tier = match entry
             .tier
             .as_deref()
@@ -777,7 +838,32 @@ pub fn parse_subtask_plan(
             parameters,
             tier,
             model,
+            reviews,
+            max_revisions,
         });
+    }
+
+    // Enforce the v1 review-loop constraints: at most one critic per worker, and
+    // no chained loops (a critic's target may not itself be a critic). A violation
+    // drops the offending `reviews` field — the subtask degrades to a plain
+    // dependent — rather than rejecting the whole plan.
+    let critic_ids: HashSet<String> = subtasks
+        .iter()
+        .filter(|s| s.reviews.is_some())
+        .map(|s| s.id.clone())
+        .collect();
+    let mut reviewed: HashSet<String> = HashSet::new();
+    for st in &mut subtasks {
+        let Some(target) = st.reviews.clone() else {
+            continue;
+        };
+        if critic_ids.contains(&target) {
+            tracing::warn!(critic = %st.id, %target, "dropping chained review loop: target is itself a critic");
+            st.reviews = None;
+        } else if !reviewed.insert(target.clone()) {
+            tracing::warn!(critic = %st.id, %target, "dropping duplicate critic: worker already has one");
+            st.reviews = None;
+        }
     }
 
     if has_cycle(&subtasks) {

@@ -22,10 +22,11 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinSet;
 
-use crate::swarm::decompose::{sink_ids, Decomposer, SubTask};
+use crate::swarm::decompose::{Decomposer, SubTask};
+use crate::swarm::envelope::Verdict;
 use crate::swarm::roster::{AgentConfig, Roster};
 use crate::swarm::topology::{
-    planner_for, select_topology, TopologyType, WorkflowNode, ENTRY_EVENT,
+    planner_for, select_topology, CriticWiring, TopologyType, WorkflowNode, ENTRY_EVENT,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +92,9 @@ impl EventBus {
 pub struct SubtaskResult {
     pub output: String,
     pub artifacts: Vec<String>,
+    /// Set by the spawner only for review-loop critics: the critic's accept/revise
+    /// decision. The kernel routes the loop on it; ignored for ordinary subtasks.
+    pub verdict: Option<Verdict>,
 }
 
 /// The bridge from the kernel to actual Goose agent execution: run one subtask as
@@ -119,6 +123,12 @@ const TRUNCATION_MARKER: &str =
 
 fn artifacts_key(subtask_id: &str) -> String {
     format!("{subtask_id}/artifacts")
+}
+
+/// ScratchPad key holding the critic's latest feedback for a review-loop worker,
+/// injected into the worker's dependency context on its next revision pass.
+fn review_feedback_key(worker_id: &str) -> String {
+    format!("{worker_id}/review_feedback")
 }
 
 /// Cap dependency context so instruction + content + context stays within the
@@ -179,6 +189,10 @@ pub struct SwarmReport {
     pub final_output: String,
     /// Set when a circuit breaker stopped the run before the graph drained.
     pub halted: Option<String>,
+    /// Notes from review loops — currently the accept-by-exhaustion warnings when a
+    /// critic never accepted within `max_revisions` and the last draft shipped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub review_notes: Vec<String>,
 }
 
 pub struct Kernel {
@@ -257,18 +271,35 @@ impl Kernel {
 
         let subtask_by_id: HashMap<&str, &SubTask> =
             subtasks.iter().map(|s| (s.id.as_str(), s)).collect();
+        let node_idx_by_subtask: HashMap<&str, usize> = nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.subtask_id.as_str(), i))
+            .collect();
         let mut trigger_map: HashMap<&str, Vec<usize>> = HashMap::new();
         for (idx, node) in nodes.iter().enumerate() {
             for evt in &node.trigger_events {
                 trigger_map.entry(evt.as_str()).or_default().push(idx);
             }
         }
+        // Loop-back routing: a critic's revision event re-arms its worker node (and
+        // re-opens the critic for the next draft), bypassing the join barrier.
+        let mut revision_targets: HashMap<String, (usize, usize)> = HashMap::new();
+        for (cidx, node) in nodes.iter().enumerate() {
+            if let Some(wiring) = &node.critic_of {
+                if let Some(&widx) = node_idx_by_subtask.get(wiring.worker_subtask_id.as_str()) {
+                    revision_targets.insert(wiring.revision_event.clone(), (widx, cidx));
+                }
+            }
+        }
 
         let mut join_counts: HashMap<usize, usize> = HashMap::new();
         let mut dispatched = vec![false; nodes.len()];
         let mut ready: VecDeque<usize> = VecDeque::new();
-        let mut in_flight: JoinSet<Option<NodeFailure>> = JoinSet::new();
+        let mut in_flight: JoinSet<DispatchResult> = JoinSet::new();
         let mut failures: Vec<NodeFailure> = Vec::new();
+        let mut revision_counts: HashMap<String, usize> = HashMap::new();
+        let mut review_notes: Vec<String> = Vec::new();
         let mut dispatches = 0usize;
         let mut halted: Option<String> = None;
         let run_start = tokio::time::Instant::now();
@@ -278,6 +309,16 @@ impl Kernel {
 
         loop {
             while let Ok(event) = self.event_bus.receiver.try_recv() {
+                if let Some(&(widx, cidx)) = revision_targets.get(event.name.as_str()) {
+                    // Loop-back: re-arm the worker directly (bypassing join
+                    // accounting) and re-open the critic so it re-dispatches on the
+                    // worker's next draft.
+                    join_counts.remove(&widx);
+                    dispatched[widx] = true;
+                    dispatched[cidx] = false;
+                    ready.push_back(widx);
+                    continue;
+                }
                 let Some(triggered) = trigger_map.get(event.name.as_str()) else {
                     continue; // terminal event — no downstream node
                 };
@@ -346,8 +387,22 @@ impl Kernel {
             }
             if let Some(joined) = in_flight.join_next().await {
                 match joined {
-                    Ok(Some(failure)) => failures.push(failure),
-                    Ok(None) => {}
+                    Ok(DispatchResult::Terminal(Some(failure))) => failures.push(failure),
+                    Ok(DispatchResult::Terminal(None)) => {}
+                    Ok(DispatchResult::CriticVerdict {
+                        critic_success_event,
+                        verdict,
+                        wiring,
+                    }) => {
+                        self.route_critic_verdict(
+                            &wiring,
+                            &critic_success_event,
+                            verdict,
+                            &mut revision_counts,
+                            &mut review_notes,
+                        )
+                        .await;
+                    }
                     Err(e) => tracing::error!("swarm dispatch task aborted: {e}"),
                 }
             }
@@ -378,6 +433,7 @@ impl Kernel {
             dispatches,
             final_output,
             halted,
+            review_notes,
         })
     }
 
@@ -386,7 +442,7 @@ impl Kernel {
         subtasks: &[SubTask],
         outputs: &HashMap<String, String>,
     ) -> String {
-        let sinks = sink_ids(subtasks);
+        let sinks = deliverable_sinks(subtasks);
         let produced: Vec<(&String, &String)> = sinks
             .iter()
             .filter_map(|id| outputs.get(id).map(|out| (id, out)))
@@ -401,6 +457,95 @@ impl Kernel {
                 .join("\n\n"),
         }
     }
+
+    /// Route a critic's verdict onto the event graph. Lives on the kernel (not the
+    /// per-node task) because it needs the shared revision counter. On revise under
+    /// the bound it stashes feedback for the worker and republishes the loop-back
+    /// event; on accept — or accept-by-exhaustion once the bound is hit — it
+    /// publishes the worker's canonical done event (releasing downstream) plus the
+    /// critic's own completion event.
+    async fn route_critic_verdict(
+        &self,
+        wiring: &CriticWiring,
+        critic_success_event: &str,
+        verdict: Verdict,
+        revision_counts: &mut HashMap<String, usize>,
+        review_notes: &mut Vec<String>,
+    ) {
+        let worker = &wiring.worker_subtask_id;
+        if let Verdict::Revise(feedback) = verdict {
+            let count = revision_counts.entry(worker.clone()).or_insert(0);
+            if *count < wiring.max_revisions {
+                *count += 1;
+                tracing::info!(
+                    worker = %worker,
+                    revision = *count,
+                    max = wiring.max_revisions,
+                    "critic requested revision"
+                );
+                self.scratch_pad
+                    .set(
+                        review_feedback_key(worker),
+                        serde_json::Value::String(feedback),
+                    )
+                    .await;
+                self.event_bus.publish(
+                    wiring.revision_event.clone(),
+                    serde_json::json!({ "worker": worker }),
+                );
+                return;
+            }
+            let note = format!(
+                "review loop for '{worker}' exhausted {} revision(s) without critic acceptance; shipping the last draft",
+                wiring.max_revisions
+            );
+            tracing::warn!("{note}");
+            review_notes.push(note);
+        } else {
+            tracing::info!(worker = %worker, "critic accepted");
+        }
+        self.event_bus.publish(
+            wiring.worker_done_event.clone(),
+            serde_json::json!({ "worker": worker }),
+        );
+        self.event_bus.publish(
+            critic_success_event.to_string(),
+            serde_json::json!({ "worker": worker }),
+        );
+    }
+}
+
+/// Subtasks whose accepted output is a run deliverable: not a critic, and not
+/// depended on by any *non-critic* subtask. A review worker is depended on only by
+/// its critic, so it correctly surfaces as a sink here even though `sink_ids` would
+/// hide it; the critic's verdict is never mistaken for the deliverable.
+fn deliverable_sinks(subtasks: &[SubTask]) -> Vec<String> {
+    let depended_on_by_noncritic: std::collections::HashSet<&str> = subtasks
+        .iter()
+        .filter(|s| !s.is_critic())
+        .flat_map(|s| s.dependencies.iter().map(String::as_str))
+        .collect();
+    subtasks
+        .iter()
+        .filter(|s| !s.is_critic() && !depended_on_by_noncritic.contains(s.id.as_str()))
+        .map(|s| s.id.clone())
+        .collect()
+}
+
+/// What a finished [`NodeDispatch`] hands back to the kernel loop. Ordinary nodes
+/// publish their own terminal event before completing (the concurrency termination
+/// invariant depends on that ordering) and report `Terminal`. A critic that
+/// completed successfully instead returns `CriticVerdict` *without* publishing — the
+/// kernel routes it, because loop-back requires the shared revision counter. A
+/// critic that errored after retries publishes its failure event like any node and
+/// reports `Terminal`, correctly stalling the loop.
+enum DispatchResult {
+    Terminal(Option<NodeFailure>),
+    CriticVerdict {
+        critic_success_event: String,
+        verdict: Verdict,
+        wiring: CriticWiring,
+    },
 }
 
 /// One node's dispatch, owned so it can run as a spawned task alongside its
@@ -418,7 +563,7 @@ struct NodeDispatch {
 }
 
 impl NodeDispatch {
-    async fn run(self) -> Option<NodeFailure> {
+    async fn run(self) -> DispatchResult {
         let mut dependency_context =
             gather_dependency_context(&self.scratch_pad, &self.subtask).await;
         if let Some(budget) = self.spawner.prompt_token_budget(&self.subtask) {
@@ -463,8 +608,16 @@ impl NodeDispatch {
                             )
                             .await;
                     }
+                    if let Some(wiring) = &self.node.critic_of {
+                        // Defer routing to the kernel — it owns the revision counter.
+                        return DispatchResult::CriticVerdict {
+                            critic_success_event: self.node.publishes_on_success.clone(),
+                            verdict: result.verdict.unwrap_or(Verdict::Accept),
+                            wiring: wiring.clone(),
+                        };
+                    }
                     self.publish(&self.node.publishes_on_success);
-                    return None;
+                    return DispatchResult::Terminal(None);
                 }
                 Err(e) => {
                     last_error = e.to_string();
@@ -480,11 +633,11 @@ impl NodeDispatch {
         }
 
         self.publish(&self.node.publishes_on_failure);
-        Some(NodeFailure {
+        DispatchResult::Terminal(Some(NodeFailure {
             subtask_id: self.subtask.id.clone(),
             attempts: self.max_retries + 1,
             error: last_error,
-        })
+        }))
     }
 
     fn publish(&self, event_name: &str) {
@@ -497,6 +650,17 @@ impl NodeDispatch {
 
 async fn gather_dependency_context(scratch_pad: &ScratchPad, subtask: &SubTask) -> String {
     let mut sections = Vec::new();
+    // On a revision pass, a review worker sees the critic's feedback first — only
+    // ever present for a worker the kernel has looped back at least once.
+    if let Some(serde_json::Value::String(feedback)) =
+        scratch_pad.get(&review_feedback_key(&subtask.id)).await
+    {
+        if !feedback.is_empty() {
+            sections.push(format!(
+                "### Reviewer feedback (address this revision)\n{feedback}"
+            ));
+        }
+    }
     for dep in &subtask.dependencies {
         if let Some(serde_json::Value::String(out)) = scratch_pad.get(dep).await {
             sections.push(format!("### Output of {dep}\n{out}"));

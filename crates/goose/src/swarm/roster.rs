@@ -21,6 +21,9 @@ impl AgentConfig {
     /// base_prompt: own the exact unit of work, build only on the prerequisite
     /// outputs provided, and never invent facts absent from them.
     pub fn derived_for(subtask: &SubTask) -> Self {
+        if subtask.is_critic() {
+            return Self::critic_for(subtask);
+        }
         let role = if subtask.role.is_empty() {
             "worker".to_string()
         } else {
@@ -33,6 +36,33 @@ impl AgentConfig {
              Do not introduce facts, names, or quantities that appear in neither your \
              own instructions nor those outputs. Produce a complete, self-contained \
              result: your final message is consumed verbatim by downstream agents.",
+            role = role,
+            instruction = subtask.instruction,
+        );
+        Self {
+            role,
+            model: subtask.model.clone(),
+            system_prompt,
+        }
+    }
+
+    /// Framing for a review-loop critic: judge the worker's output against the
+    /// requirements and return an accept/revise verdict — never rewrite the work.
+    fn critic_for(subtask: &SubTask) -> Self {
+        let role = if subtask.role.is_empty() {
+            "critic".to_string()
+        } else {
+            subtask.role.clone()
+        };
+        let system_prompt = format!(
+            "You are the {role} agent in a multi-agent swarm: the critic in a review \
+             loop. Your job is to evaluate the worker's output against the requirements \
+             of this review: {instruction}\n\n\
+             The worker's draft is provided as your prerequisite output. Judge it — do \
+             NOT rewrite or redo the work yourself. Return 'accept' only if the output \
+             genuinely meets the requirements; otherwise return 'revise' with specific, \
+             actionable feedback the worker can act on. The worker will re-run seeing \
+             only your feedback, so make it concrete and self-contained.",
             role = role,
             instruction = subtask.instruction,
         );

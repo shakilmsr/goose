@@ -18,6 +18,7 @@ pub enum TopologyType {
     Pipeline,
     FanOutJoin,
     Dag,
+    ReviewLoop,
 }
 
 impl serde::Serialize for TopologyType {
@@ -32,13 +33,29 @@ impl TopologyType {
             TopologyType::Pipeline => "pipeline",
             TopologyType::FanOutJoin => "fan_out_join",
             TopologyType::Dag => "dag",
+            TopologyType::ReviewLoop => "review_loop",
         }
     }
 }
 
+/// Loop wiring carried by a critic node. The kernel routes on the critic's verdict
+/// rather than publishing `publishes_on_success` blindly: it emits
+/// `worker_done_event` (the worker's canonical completion, which downstream depends
+/// on) when the loop converges, or `revision_event` (re-running the worker) while
+/// under `max_revisions`.
+#[derive(Debug, Clone)]
+pub struct CriticWiring {
+    pub worker_subtask_id: String,
+    pub worker_done_event: String,
+    pub revision_event: String,
+    pub max_revisions: usize,
+}
+
 /// One node of the event graph. `trigger_events` fire it, `join_after > 1` makes
 /// it a join barrier (dispatch only after that many trigger occurrences), and on
-/// completion the kernel publishes the success or failure event.
+/// completion the kernel publishes the success or failure event. A node with
+/// `critic_of` set is a review-loop critic: the kernel routes on its verdict
+/// instead of publishing `publishes_on_success` unconditionally.
 #[derive(Debug, Clone)]
 pub struct WorkflowNode {
     pub id: String,
@@ -47,6 +64,7 @@ pub struct WorkflowNode {
     pub join_after: usize,
     pub publishes_on_success: String,
     pub publishes_on_failure: String,
+    pub critic_of: Option<CriticWiring>,
 }
 
 fn safe_id(id: &str) -> String {
@@ -61,6 +79,18 @@ fn done_event(subtask_id: &str) -> String {
 
 fn blocked_event(subtask_id: &str) -> String {
     format!("SUBTASK_{}_BLOCKED", safe_id(subtask_id))
+}
+
+/// Intermediate event a review-loop worker publishes on success — consumed only by
+/// its critic, so downstream (which waits on the canonical done event) does not
+/// fire until the critic accepts.
+fn review_draft_event(worker_id: &str) -> String {
+    format!("RL_DRAFT_{}", safe_id(worker_id))
+}
+
+/// Loop-back event the kernel publishes to re-run a review-loop worker.
+fn revision_event(worker_id: &str) -> String {
+    format!("RL_REVISION_{}", safe_id(worker_id))
 }
 
 /// True only for the clean "N independent roots -> exactly one sink" shape:
@@ -110,6 +140,12 @@ fn is_chain(subtasks: &[SubTask]) -> bool {
 /// Infer the topology from the actual dependency graph — the most authoritative
 /// signal available (port of `_shape_from_decomposition`).
 pub fn select_topology(subtasks: &[SubTask]) -> TopologyType {
+    // A declared review loop is a cycle the dependency graph cannot express, so it
+    // is never inferred — its presence is the signal. It routes through the
+    // review-aware DAG planner, which also handles any surrounding acyclic edges.
+    if subtasks.iter().any(SubTask::is_critic) {
+        return TopologyType::ReviewLoop;
+    }
     if subtasks.len() < 2 {
         return TopologyType::Pipeline;
     }
@@ -150,6 +186,7 @@ impl TopologyExecutor for PipelineExecutor {
                 join_after: 0,
                 publishes_on_success: done_event(&st.id),
                 publishes_on_failure: blocked_event(&st.id),
+                critic_of: None,
             })
             .collect())
     }
@@ -169,7 +206,7 @@ impl TopologyExecutor for DagExecutor {
             return Err(anyhow!("cannot plan an empty subtask list"));
         }
         let known: HashSet<&str> = subtasks.iter().map(|s| s.id.as_str()).collect();
-        subtasks
+        let mut nodes: Vec<WorkflowNode> = subtasks
             .iter()
             .map(|st| {
                 for dep in &st.dependencies {
@@ -196,15 +233,64 @@ impl TopologyExecutor for DagExecutor {
                     },
                     publishes_on_success: done_event(&st.id),
                     publishes_on_failure: blocked_event(&st.id),
+                    critic_of: None,
                 })
             })
-            .collect()
+            .collect::<Result<_>>()?;
+        wire_review_loops(&mut nodes, subtasks)?;
+        Ok(nodes)
     }
+}
+
+/// Rewire the plain 1:1 graph for each declared review loop. A critic C
+/// (`reviews = W`) gates its worker's canonical completion: W is switched to
+/// publish an intermediate draft event (consumed only by C) and to re-trigger on
+/// the loop-back event; C triggers on the draft, and its [`CriticWiring`] lets the
+/// kernel publish W's canonical done on accept or the loop-back on revise. The
+/// parser guarantees each worker has at most one critic, so the last critic in
+/// slice order wins if this is ever called on an unvalidated plan.
+fn wire_review_loops(nodes: &mut [WorkflowNode], subtasks: &[SubTask]) -> Result<()> {
+    let node_index: std::collections::HashMap<String, usize> = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.subtask_id.clone(), i))
+        .collect();
+    for st in subtasks {
+        let Some(worker_id) = &st.reviews else {
+            continue;
+        };
+        let worker_idx = *node_index
+            .get(worker_id.as_str())
+            .ok_or_else(|| anyhow!("critic '{}' reviews unknown subtask '{}'", st.id, worker_id))?;
+        let critic_idx = node_index[st.id.as_str()];
+
+        let draft = review_draft_event(worker_id);
+        let revision = revision_event(worker_id);
+
+        let worker = &mut nodes[worker_idx];
+        worker.publishes_on_success = draft.clone();
+        if !worker.trigger_events.contains(&revision) {
+            worker.trigger_events.push(revision.clone());
+        }
+
+        let critic = &mut nodes[critic_idx];
+        critic.trigger_events = vec![draft];
+        critic.join_after = 0;
+        critic.critic_of = Some(CriticWiring {
+            worker_subtask_id: worker_id.clone(),
+            worker_done_event: done_event(worker_id),
+            revision_event: revision,
+            max_revisions: st.max_revisions,
+        });
+    }
+    Ok(())
 }
 
 pub fn planner_for(topology: TopologyType) -> Box<dyn TopologyExecutor> {
     match topology {
         TopologyType::Pipeline => Box::new(PipelineExecutor),
-        TopologyType::FanOutJoin | TopologyType::Dag => Box::new(DagExecutor),
+        TopologyType::FanOutJoin | TopologyType::Dag | TopologyType::ReviewLoop => {
+            Box::new(DagExecutor)
+        }
     }
 }

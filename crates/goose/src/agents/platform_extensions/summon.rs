@@ -15,9 +15,12 @@ use crate::session::SessionType;
 use crate::sources::parse_frontmatter;
 use crate::swarm::decompose::{
     parse_subtask_plan, usable_budget, Decomposer, FixedPlan, PlanTrust, SemanticDecomposer,
-    SubTask, Tier, MAX_SUBTASKS,
+    SubTask, Tier, DEFAULT_MAX_REVISIONS, MAX_SUBTASKS,
 };
-use crate::swarm::envelope::{envelope_schema_for, interpret_subtask_output, SubtaskOutcome};
+use crate::swarm::envelope::{
+    critic_envelope_schema, envelope_schema_for, interpret_critic_output, interpret_subtask_output,
+    SubtaskOutcome,
+};
 use crate::swarm::kernel::{AgentSpawner, Kernel, SubtaskResult, SwarmReport};
 use crate::swarm::roster::AgentConfig as SwarmAgentConfig;
 use crate::utils::safe_truncate;
@@ -93,6 +96,10 @@ pub struct SwarmExecuteParams {
     pub max_duration_secs: Option<u64>,
     #[serde(default)]
     pub max_concurrent_subtasks: Option<usize>,
+    #[serde(default)]
+    pub review: bool,
+    #[serde(default)]
+    pub max_revisions: Option<usize>,
     #[serde(default)]
     pub r#async: bool,
 }
@@ -662,6 +669,15 @@ impl SummonClient {
                             "model": {
                                 "type": "string",
                                 "description": "Exact model for this subtask, overriding tier routing. Must be valid for the swarm's provider."
+                            },
+                            "reviews": {
+                                "type": "integer",
+                                "description": "Makes this subtask a critic in a review loop: the zero-based index of the worker subtask it judges. The critic returns an accept/revise verdict; on revise the worker re-runs with the feedback until it passes or 'max_revisions' is hit. One critic per worker; a critic must not review another critic. Downstream steps depend on the WORKER, not the critic."
+                            },
+                            "max_revisions": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "description": "Revision cap for the review loop this critic governs (default 2). Only meaningful with 'reviews'."
                             }
                         }
                     }
@@ -713,6 +729,16 @@ impl SummonClient {
                     "minimum": 1,
                     "description": "How many independent subtasks may run at once (default: GOOSE_MAX_BACKGROUND_TASKS, 5). Use 1 to force sequential dispatch."
                 },
+                "review": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Convenience: wrap 'task' in a worker+critic review loop — one agent does the work, a critic judges it and sends it back for revision until it passes or 'max_revisions' is reached. Cannot be combined with 'subtasks' or 'source'; for a review loop inside a larger plan, add a critic subtask with a 'reviews' field instead."
+                },
+                "max_revisions": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Revision cap for the 'review' convenience loop (default 2). Only valid with 'review'."
+                },
                 "async": {
                     "type": "boolean",
                     "default": false,
@@ -732,7 +758,11 @@ impl SummonClient {
              2. `subtasks`: supply the plan yourself — no planning LLM call. A single entry \
              runs one subagent directly (the replacement for a plain delegated task).\n\
              3. `source`: run a named subrecipe, recipe, or agent as a single-subtask swarm; \
-             `task` becomes its work instructions.\n\n\
+             `task` becomes its work instructions.\n\
+             4. `review: true`: wrap `task` in a worker+critic review loop — the work is \
+             drafted, a critic judges it, and it is sent back for revision until it passes \
+             or `max_revisions` is reached. For a review loop inside a larger plan, give a \
+             `subtasks` critic entry a `reviews` index instead.\n\n\
              Outputs pass between subtasks through a shared scratch pad — each dependent \
              receives exactly its prerequisites' outputs — and the final sink output(s) are \
              returned here.\n\n\
@@ -773,6 +803,21 @@ impl SummonClient {
             return Err(
                 "'source' and 'subtasks' cannot be combined; use the per-subtask 'source' \
                  field inside 'subtasks' instead"
+                    .to_string(),
+            );
+        }
+        if params.review && (params.subtasks.is_some() || params.source.is_some()) {
+            return Err(
+                "'review' is a convenience for wrapping 'task' in a worker+critic loop; it \
+                 cannot be combined with 'subtasks' or 'source' (declare a critic subtask \
+                 with a 'reviews' field inside 'subtasks' instead)"
+                    .to_string(),
+            );
+        }
+        if params.max_revisions.is_some() && !params.review {
+            return Err(
+                "top-level 'max_revisions' only applies to the 'review' convenience; set it \
+                 per-critic inside 'subtasks' otherwise"
                     .to_string(),
             );
         }
@@ -865,6 +910,23 @@ impl SummonClient {
             st.source = Some(source_name.clone());
             st.parameters = params.parameters.clone();
             Some(vec![st])
+        } else if params.review {
+            // Convenience: wrap the task in a worker + critic review loop. Built as
+            // a JSON plan so it flows through the same validation as any caller plan.
+            let plan = serde_json::json!([
+                { "instruction": params.task },
+                {
+                    "instruction": format!(
+                        "Critically review the worker's output (provided as your prerequisite) \
+                         against the original task and its requirements: correctness, \
+                         completeness, and quality. Original task: {}",
+                        params.task
+                    ),
+                    "reviews": 0,
+                    "max_revisions": params.max_revisions.unwrap_or(DEFAULT_MAX_REVISIONS),
+                }
+            ]);
+            Some(parse_explicit_subtasks(&plan, &available_extensions)?)
         } else {
             params
                 .subtasks
@@ -2269,7 +2331,11 @@ impl AgentSpawner for SummonAgentSpawner {
                 .map_err(|e| anyhow::anyhow!("Failed to build swarm subtask recipe: {}", e))?,
         };
         recipe.response = Some(Response {
-            json_schema: Some(envelope_schema_for(subtask.output_schema.as_ref())),
+            json_schema: Some(if subtask.is_critic() {
+                critic_envelope_schema()
+            } else {
+                envelope_schema_for(subtask.output_schema.as_ref())
+            }),
         });
 
         let agent_config = AgentConfig::new(
@@ -2323,10 +2389,16 @@ impl AgentSpawner for SummonAgentSpawner {
         })
         .await?;
 
-        match interpret_subtask_output(&raw) {
+        let (outcome, verdict) = if subtask.is_critic() {
+            interpret_critic_output(&raw)
+        } else {
+            (interpret_subtask_output(&raw), None)
+        };
+        match outcome {
             SubtaskOutcome::Success(output) => Ok(SubtaskResult {
                 output,
                 artifacts: collect_artifact_files(&artifact_dir),
+                verdict,
             }),
             SubtaskOutcome::Failed(reason) => Err(anyhow::anyhow!(
                 "subtask {} reported failure: {}",
@@ -2376,6 +2448,9 @@ fn render_swarm_report(report: &SwarmReport) -> String {
     }
     if let Some(reason) = &report.halted {
         out.push_str(&format!("\nRun halted early: {}\n", reason));
+    }
+    for note in &report.review_notes {
+        out.push_str(&format!("\nReview loop: {}\n", note));
     }
     if !report.artifacts.is_empty() {
         out.push_str("\nArtifact files produced:\n");
@@ -3089,6 +3164,8 @@ You review code."#;
             subtask_timeout_secs: None,
             max_duration_secs: None,
             max_concurrent_subtasks: None,
+            review: false,
+            max_revisions: None,
             r#async: false,
         }
     }
@@ -3216,6 +3293,22 @@ You review code."#;
         let plan = parse_explicit_subtasks(&value, &[]).unwrap();
         assert_eq!(plan.len(), 1);
         assert!(plan[0].dependencies.is_empty());
+    }
+
+    #[test]
+    fn test_review_convenience_builds_worker_and_critic() {
+        // Mirrors the plan `prepare_swarm` constructs for `review: true`.
+        let value = serde_json::json!([
+            { "instruction": "write the report" },
+            { "instruction": "review it", "reviews": 0, "max_revisions": 3 }
+        ]);
+        let plan = parse_explicit_subtasks(&value, &[]).unwrap();
+        assert_eq!(plan.len(), 2);
+        assert!(!plan[0].is_critic());
+        assert!(plan[1].is_critic());
+        assert_eq!(plan[1].reviews.as_deref(), Some("subtask-1"));
+        assert_eq!(plan[1].max_revisions, 3);
+        assert_eq!(plan[1].dependencies, vec!["subtask-1".to_string()]);
     }
 
     #[test]
