@@ -5003,6 +5003,7 @@ dependencies = [
  "webbrowser",
  "which 8.0.3",
  "winapi",
+ "windows-sys 0.59.0",
  "wiremock",
 ]
 

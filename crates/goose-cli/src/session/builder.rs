@@ -510,7 +510,7 @@ pub async fn build_session(session_config: SessionBuilderConfig) -> CliSession {
     if session_config.sandbox {
         agent
             .set_sandbox(Some(Arc::new(
-                goose::sandbox::LocalBackend::with_default_policy(),
+                goose::sandbox::DefaultSandboxBackend::with_default_policy(),
             )))
             .await;
     }

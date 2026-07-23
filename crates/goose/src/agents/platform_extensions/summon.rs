@@ -980,7 +980,7 @@ impl SummonClient {
                 writable_work_root: workspace_root.clone(),
                 ..Default::default()
             };
-            Some(Arc::new(crate::sandbox::LocalBackend::new(policy)))
+            Some(Arc::new(crate::sandbox::DefaultSandboxBackend::new(policy)))
         } else {
             None
         };

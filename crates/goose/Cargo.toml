@@ -250,6 +250,14 @@ keyring = { workspace = true, features = ["apple-native"], optional = true }
 keyring = { workspace = true, features = ["sync-secret-service"], optional = true }
 libc = { version = "0.2.182", default-features = false, features = ["std"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 serial_test = { workspace = true }
 mockall = { version = "0.14", default-features = false }

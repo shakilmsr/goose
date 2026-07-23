@@ -74,6 +74,7 @@ uuid = { version = "1.23", default-features = false, features = ["v4", "std"] }
 webbrowser = { version = "1", default-features = false }
 which = { version = "8", default-features = false, features = ["real-sys"] }
 winapi = { version = "0.3.9", default-features = false, features = ["wincred", "std"] }
+windows-sys = { version = "0.59", default-features = false }
 wiremock = { version = "0.6", default-features = false }
 zip = { version = "8", default-features = false, features = ["deflate"] }
 serial_test = { version = "3", default-features = false }

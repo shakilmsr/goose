@@ -790,7 +790,9 @@ async fn set_sandbox(
     let agent = state.get_agent(request.session_id.clone()).await?;
 
     let backend: Option<goose::sandbox::DynSandboxBackend> = if request.enabled {
-        Some(Arc::new(goose::sandbox::LocalBackend::with_default_policy()))
+        Some(Arc::new(
+            goose::sandbox::DefaultSandboxBackend::with_default_policy(),
+        ))
     } else {
         None
     };
