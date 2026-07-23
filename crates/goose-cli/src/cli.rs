@@ -122,6 +122,12 @@ pub struct SessionOptions {
         long_help = "Run extensions (stdio and built-in) inside the specified container. The extension must exist in the container. For built-in extensions, goose must be installed inside the container."
     )]
     pub container: Option<String>,
+
+    #[arg(
+        long = "sandbox",
+        help = "Enable OS sandbox execution for terminal commands"
+    )]
+    pub sandbox: bool,
 }
 
 #[derive(Debug, Clone)]

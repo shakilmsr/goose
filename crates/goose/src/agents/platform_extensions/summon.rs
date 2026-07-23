@@ -101,6 +101,12 @@ pub struct SwarmExecuteParams {
     #[serde(default)]
     pub max_revisions: Option<usize>,
     #[serde(default)]
+    pub verify: bool,
+    #[serde(default)]
+    pub verify_command: Option<String>,
+    #[serde(default)]
+    pub sandbox: bool,
+    #[serde(default)]
     pub r#async: bool,
 }
 
@@ -969,6 +975,16 @@ impl SummonClient {
             notification_buffer,
         );
 
+        let sandbox_backend: Option<crate::sandbox::DynSandboxBackend> = if params.sandbox {
+            let policy = crate::sandbox::SandboxPolicy {
+                writable_work_root: workspace_root.clone(),
+                ..Default::default()
+            };
+            Some(Arc::new(crate::sandbox::LocalBackend::new(policy)))
+        } else {
+            None
+        };
+
         let spawner = Arc::new(SummonAgentSpawner {
             session_manager: self.context.session_manager.clone(),
             task_config,
@@ -979,6 +995,7 @@ impl SummonClient {
             on_message,
             source_recipes,
             models: swarm_models,
+            sandbox: sandbox_backend,
         });
 
         let mut kernel = Kernel::new(spawner).with_max_concurrency(
@@ -2219,6 +2236,7 @@ struct SummonAgentSpawner {
     /// Tier/pinned-model routing; subtasks it does not cover run on
     /// `task_config.model_config`.
     models: SwarmModels,
+    sandbox: Option<crate::sandbox::DynSandboxBackend>,
 }
 
 impl SummonAgentSpawner {
@@ -2278,6 +2296,34 @@ impl AgentSpawner for SummonAgentSpawner {
         let artifact_dir = self.workspace_root.join(&subtask.id);
         if let Err(e) = std::fs::create_dir_all(&artifact_dir) {
             warn!("failed to create artifact dir for {}: {}", subtask.id, e);
+        }
+
+        if let Some(spec) = &subtask.verify {
+            if subtask.is_verifier() {
+                let execution =
+                    crate::agents::platform_extensions::developer::shell::run_command_for_verify(
+                        &spec.command,
+                        Some(60),
+                        Some(&self.workspace_root),
+                        self.sandbox.as_deref(),
+                    )
+                    .await;
+                let (exit_code, stdout, stderr) = match execution {
+                    Ok(out) => out,
+                    Err(e) => (None, String::new(), e),
+                };
+                let (outcome, verdict) =
+                    crate::swarm::envelope::interpret_verify_result(exit_code, &stdout, &stderr);
+                let text = match outcome {
+                    crate::swarm::envelope::SubtaskOutcome::Success(s) => s,
+                    crate::swarm::envelope::SubtaskOutcome::Failed(f) => f,
+                };
+                return Ok(SubtaskResult {
+                    output: text,
+                    artifacts: Vec::new(),
+                    verdict: Some(verdict),
+                });
+            }
         }
 
         let mut prompt = subtask.instruction.clone();
@@ -2386,6 +2432,7 @@ impl AgentSpawner for SummonAgentSpawner {
             cancellation_token: Some(self.cancellation_token.child_token()),
             on_message: self.on_message.clone(),
             notification_tx: Some(self.notification_tx.clone()),
+            sandbox: self.sandbox.clone(),
         })
         .await?;
 
@@ -3166,6 +3213,9 @@ You review code."#;
             max_concurrent_subtasks: None,
             review: false,
             max_revisions: None,
+            verify: false,
+            verify_command: None,
+            sandbox: false,
             r#async: false,
         }
     }

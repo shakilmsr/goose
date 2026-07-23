@@ -43,6 +43,7 @@ pub struct SubagentRunParams {
     pub cancellation_token: Option<CancellationToken>,
     pub on_message: Option<OnMessageCallback>,
     pub notification_tx: Option<tokio::sync::mpsc::UnboundedSender<ServerNotification>>,
+    pub sandbox: Option<crate::sandbox::DynSandboxBackend>,
 }
 
 pub async fn run_subagent_task(params: SubagentRunParams) -> Result<String, anyhow::Error> {
@@ -129,6 +130,7 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
             cancellation_token,
             on_message,
             notification_tx,
+            sandbox,
             ..
         } = params;
 
@@ -139,6 +141,9 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
             .unwrap_or_else(|| "Begin.".to_string());
 
         let agent = Arc::new(Agent::with_config(config));
+        if let Some(sb) = sandbox {
+            agent.set_sandbox(Some(sb)).await;
+        }
 
         agent
             .update_provider(

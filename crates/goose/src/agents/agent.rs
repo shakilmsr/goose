@@ -255,6 +255,7 @@ pub struct Agent {
     #[cfg(test)]
     stop_hook_block_cap_override: Option<u32>,
     container: Mutex<Option<Container>>,
+    sandbox: Mutex<Option<crate::sandbox::DynSandboxBackend>>,
     goal: Mutex<Option<String>>,
     grind: Mutex<Option<String>>,
     pending_steers: Mutex<HashMap<String, VecDeque<Message>>>,
@@ -387,6 +388,7 @@ impl Agent {
             #[cfg(test)]
             stop_hook_block_cap_override: None,
             container: Mutex::new(None),
+            sandbox: Mutex::new(None),
             goal: Mutex::new(None),
             grind: Mutex::new(None),
             pending_steers: Mutex::new(HashMap::new()),
@@ -891,6 +893,15 @@ impl Agent {
         self.container.lock().await.clone()
     }
 
+    /// When set, shell executions route through the active sandbox backend.
+    pub async fn set_sandbox(&self, sandbox: Option<crate::sandbox::DynSandboxBackend>) {
+        *self.sandbox.lock().await = sandbox;
+    }
+
+    pub async fn sandbox(&self) -> Option<crate::sandbox::DynSandboxBackend> {
+        self.sandbox.lock().await.clone()
+    }
+
     /// Check if a tool is a frontend tool
     pub async fn is_frontend_tool(&self, name: &str) -> bool {
         self.frontend_tools.lock().await.contains_key(name)
@@ -1134,7 +1145,8 @@ impl Agent {
             session.id.clone(),
             Some(session.working_dir.clone()),
             Some(request_id.clone()),
-        );
+        )
+        .with_sandbox(self.sandbox().await);
 
         debug!("WAITING_TOOL_START: {}", tool_call.name);
         let result: ToolCallResult = if self.is_frontend_tool(&tool_call.name).await {

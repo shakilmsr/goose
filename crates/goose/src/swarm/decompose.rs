@@ -143,6 +143,19 @@ pub struct SubTask {
         skip_serializing_if = "is_default_max_revisions"
     )]
     pub max_revisions: usize,
+    /// When set, this subtask includes automated command verification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify: Option<VerifySpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VerifySpec {
+    pub command: String,
+    #[serde(
+        default = "default_max_revisions",
+        skip_serializing_if = "is_default_max_revisions"
+    )]
+    pub max_revisions: usize,
 }
 
 impl SubTask {
@@ -162,12 +175,18 @@ impl SubTask {
             model: None,
             reviews: None,
             max_revisions: DEFAULT_MAX_REVISIONS,
+            verify: None,
         }
     }
 
     /// Whether this subtask is a critic in a review loop.
     pub fn is_critic(&self) -> bool {
         self.reviews.is_some()
+    }
+
+    /// Whether this subtask is a command verifier node.
+    pub fn is_verifier(&self) -> bool {
+        self.verify.is_some() && self.reviews.is_some()
     }
 }
 
@@ -630,6 +649,8 @@ struct RawPlanEntry {
     reviews: Option<serde_json::Value>,
     #[serde(default)]
     max_revisions: Option<usize>,
+    #[serde(default)]
+    verify: Option<VerifySpec>,
 }
 
 /// Keep only sane relative paths: non-empty, not absolute, no parent traversal.
@@ -840,6 +861,7 @@ pub fn parse_subtask_plan(
             model,
             reviews,
             max_revisions,
+            verify: entry.verify.clone(),
         });
     }
 

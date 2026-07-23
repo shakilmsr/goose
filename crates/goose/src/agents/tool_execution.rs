@@ -20,6 +20,7 @@ pub struct ToolCallContext {
     pub session_id: String,
     pub working_dir: Option<PathBuf>,
     pub tool_call_request_id: Option<String>,
+    pub sandbox: Option<crate::sandbox::DynSandboxBackend>,
 }
 
 impl ToolCallContext {
@@ -32,7 +33,13 @@ impl ToolCallContext {
             session_id,
             working_dir,
             tool_call_request_id,
+            sandbox: None,
         }
+    }
+
+    pub fn with_sandbox(mut self, sandbox: Option<crate::sandbox::DynSandboxBackend>) -> Self {
+        self.sandbox = sandbox;
+        self
     }
 
     pub fn working_dir_str(&self) -> Option<&str> {

@@ -119,6 +119,8 @@ pub struct SessionBuilderConfig {
     pub container: Option<Container>,
     /// Print generation statistics after headless runs.
     pub stats: bool,
+    /// Whether to enable OS sandbox execution for terminal commands.
+    pub sandbox: bool,
 }
 
 /// Manual implementation of Default to ensure proper initialization of output_format
@@ -147,6 +149,7 @@ impl Default for SessionBuilderConfig {
             output_format: "text".to_string(),
             container: None,
             stats: false,
+            sandbox: false,
         }
     }
 }
@@ -502,6 +505,14 @@ pub async fn build_session(session_config: SessionBuilderConfig) -> CliSession {
 
     if session_config.container.is_some() {
         agent.set_container(session_config.container.clone()).await;
+    }
+
+    if session_config.sandbox {
+        agent
+            .set_sandbox(Some(Arc::new(
+                goose::sandbox::LocalBackend::with_default_policy(),
+            )))
+            .await;
     }
 
     let session_manager = agent.config.session_manager.clone();

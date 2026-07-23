@@ -207,3 +207,48 @@ pub fn interpret_subtask_output(raw: &str) -> SubtaskOutcome {
         Err(_) => SubtaskOutcome::Success(raw.to_string()),
     }
 }
+
+/// Interpret command execution results for a verify loop. Exit code 0 yields Accept;
+/// non-zero exit code or process failure yields Revise with error details.
+pub fn interpret_verify_result(
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> (SubtaskOutcome, Verdict) {
+    match exit_code {
+        Some(0) => {
+            let output = if stdout.trim().is_empty() {
+                "Verification command exited 0 (success)".to_string()
+            } else {
+                stdout.to_string()
+            };
+            (SubtaskOutcome::Success(output), Verdict::Accept)
+        }
+        Some(code) => {
+            let err_msg = if !stderr.trim().is_empty() {
+                stderr.trim().to_string()
+            } else if !stdout.trim().is_empty() {
+                stdout.trim().to_string()
+            } else {
+                format!("Verification command failed with exit code {code}")
+            };
+            let feedback = format!("Command failed (exit code {code}):\n{err_msg}");
+            (
+                SubtaskOutcome::Failed(feedback.clone()),
+                Verdict::Revise(feedback),
+            )
+        }
+        None => {
+            let err_msg = if !stderr.trim().is_empty() {
+                stderr.trim().to_string()
+            } else {
+                "Verification command timed out or was killed".to_string()
+            };
+            let feedback = format!("Command error:\n{err_msg}");
+            (
+                SubtaskOutcome::Failed(feedback.clone()),
+                Verdict::Revise(feedback),
+            )
+        }
+    }
+}

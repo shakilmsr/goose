@@ -109,6 +109,12 @@ pub struct SetContainerRequest {
     container_id: Option<String>,
 }
 
+#[derive(Deserialize, utoipa::ToSchema)]
+pub struct SetSandboxRequest {
+    session_id: String,
+    enabled: bool,
+}
+
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct ResumeAgentResponse {
     pub session: Session,
@@ -768,6 +774,33 @@ async fn set_container(
 
 #[utoipa::path(
     post,
+    path = "/agent/set_sandbox",
+    request_body = SetSandboxRequest,
+    responses(
+        (status = 200, description = "Sandbox state set successfully"),
+        (status = 401, description = "Unauthorized - invalid secret key"),
+        (status = 424, description = "Agent not initialized"),
+        (status = 500, description = "Internal server error")
+    )
+)]
+async fn set_sandbox(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<SetSandboxRequest>,
+) -> Result<StatusCode, ErrorResponse> {
+    let agent = state.get_agent(request.session_id.clone()).await?;
+
+    let backend: Option<goose::sandbox::DynSandboxBackend> = if request.enabled {
+        Some(Arc::new(goose::sandbox::LocalBackend::with_default_policy()))
+    } else {
+        None
+    };
+    agent.set_sandbox(backend).await;
+
+    Ok(StatusCode::OK)
+}
+
+#[utoipa::path(
+    post,
     path = "/agent/stop",
     request_body = StopAgentRequest,
     responses(
@@ -1014,6 +1047,7 @@ pub fn routes(state: Arc<AppState>) -> Router {
         .route("/agent/add_extension", post(agent_add_extension))
         .route("/agent/remove_extension", post(agent_remove_extension))
         .route("/agent/set_container", post(set_container))
+        .route("/agent/set_sandbox", post(set_sandbox))
         .route("/agent/stop", post(stop_agent))
         .with_state(state)
 }

@@ -265,6 +265,7 @@ impl Kernel {
         if subtasks.is_empty() {
             return Err(anyhow!("decomposer produced no subtasks"));
         }
+        let subtasks = crate::swarm::topology::expand_verify_subtasks(&subtasks);
         let topology = select_topology(&subtasks);
         let nodes = planner_for(topology).plan(&subtasks)?;
         self.roster.extend_from_subtasks(&subtasks);

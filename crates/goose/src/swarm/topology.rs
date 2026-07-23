@@ -19,6 +19,7 @@ pub enum TopologyType {
     FanOutJoin,
     Dag,
     ReviewLoop,
+    VerifyLoop,
 }
 
 impl serde::Serialize for TopologyType {
@@ -34,6 +35,7 @@ impl TopologyType {
             TopologyType::FanOutJoin => "fan_out_join",
             TopologyType::Dag => "dag",
             TopologyType::ReviewLoop => "review_loop",
+            TopologyType::VerifyLoop => "verify_loop",
         }
     }
 }
@@ -140,6 +142,9 @@ fn is_chain(subtasks: &[SubTask]) -> bool {
 /// Infer the topology from the actual dependency graph — the most authoritative
 /// signal available (port of `_shape_from_decomposition`).
 pub fn select_topology(subtasks: &[SubTask]) -> TopologyType {
+    if subtasks.iter().any(|s| s.verify.is_some()) {
+        return TopologyType::VerifyLoop;
+    }
     // A declared review loop is a cycle the dependency graph cannot express, so it
     // is never inferred — its presence is the signal. It routes through the
     // review-aware DAG planner, which also handles any surrounding acyclic edges.
@@ -198,6 +203,28 @@ impl TopologyExecutor for PipelineExecutor {
 /// Also serves fan-out-join — that shape is just a DAG whose join has N root
 /// dependencies. Assumes the graph is acyclic (guaranteed by the decomposer's
 /// validation), but fails loudly on a dependency naming no known subtask.
+pub fn expand_verify_subtasks(subtasks: &[SubTask]) -> Vec<SubTask> {
+    let mut expanded = Vec::with_capacity(subtasks.len());
+    for st in subtasks {
+        expanded.push(st.clone());
+        if let Some(spec) = &st.verify {
+            if st.reviews.is_none() {
+                let verifier_id = format!("{}_verifier", st.id);
+                let mut verifier = SubTask::new(
+                    verifier_id,
+                    format!("Run verification command: {}", spec.command),
+                );
+                verifier.reviews = Some(st.id.clone());
+                verifier.dependencies = vec![st.id.clone()];
+                verifier.max_revisions = spec.max_revisions;
+                verifier.verify = Some(spec.clone());
+                expanded.push(verifier);
+            }
+        }
+    }
+    expanded
+}
+
 pub struct DagExecutor;
 
 impl TopologyExecutor for DagExecutor {
@@ -205,6 +232,7 @@ impl TopologyExecutor for DagExecutor {
         if subtasks.is_empty() {
             return Err(anyhow!("cannot plan an empty subtask list"));
         }
+        let subtasks = expand_verify_subtasks(subtasks);
         let known: HashSet<&str> = subtasks.iter().map(|s| s.id.as_str()).collect();
         let mut nodes: Vec<WorkflowNode> = subtasks
             .iter()
@@ -237,7 +265,7 @@ impl TopologyExecutor for DagExecutor {
                 })
             })
             .collect::<Result<_>>()?;
-        wire_review_loops(&mut nodes, subtasks)?;
+        wire_review_loops(&mut nodes, &subtasks)?;
         Ok(nodes)
     }
 }
@@ -289,8 +317,9 @@ fn wire_review_loops(nodes: &mut [WorkflowNode], subtasks: &[SubTask]) -> Result
 pub fn planner_for(topology: TopologyType) -> Box<dyn TopologyExecutor> {
     match topology {
         TopologyType::Pipeline => Box::new(PipelineExecutor),
-        TopologyType::FanOutJoin | TopologyType::Dag | TopologyType::ReviewLoop => {
-            Box::new(DagExecutor)
-        }
+        TopologyType::FanOutJoin
+        | TopologyType::Dag
+        | TopologyType::ReviewLoop
+        | TopologyType::VerifyLoop => Box::new(DagExecutor),
     }
 }

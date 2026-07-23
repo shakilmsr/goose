@@ -1025,3 +1025,38 @@ fn interpret_critic_output_routes_verdicts() {
     // the critic schema is a valid, non-empty JSON Schema object
     assert!(critic_envelope_schema().is_object());
 }
+
+#[test]
+fn test_verify_loop_topology_selection_and_expansion() {
+    use goose::swarm::decompose::VerifySpec;
+    use goose::swarm::envelope::interpret_verify_result;
+    use goose::swarm::topology::expand_verify_subtasks;
+
+    let mut st = SubTask::new("worker-1", "build feature");
+    st.verify = Some(VerifySpec {
+        command: "cargo test".to_string(),
+        max_revisions: 3,
+    });
+
+    let subtasks = vec![st];
+    let top = select_topology(&subtasks);
+    assert_eq!(top, TopologyType::VerifyLoop);
+
+    let expanded = expand_verify_subtasks(&subtasks);
+    assert_eq!(expanded.len(), 2);
+    assert_eq!(expanded[0].id, "worker-1");
+    assert_eq!(expanded[1].id, "worker-1_verifier");
+    assert_eq!(expanded[1].reviews, Some("worker-1".to_string()));
+    assert_eq!(expanded[1].dependencies, vec!["worker-1".to_string()]);
+
+    let (outcome, verdict) = interpret_verify_result(Some(0), "all tests passed", "");
+    assert!(matches!(outcome, SubtaskOutcome::Success(_)));
+    assert_eq!(verdict, Verdict::Accept);
+
+    let (outcome, verdict) = interpret_verify_result(Some(1), "", "test failed: assertion error");
+    assert!(matches!(outcome, SubtaskOutcome::Failed(_)));
+    assert_eq!(
+        verdict,
+        Verdict::Revise("Command failed (exit code 1):\ntest failed: assertion error".to_string())
+    );
+}

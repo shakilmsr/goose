@@ -353,6 +353,16 @@ impl ShellTool {
         params: ShellParams,
         working_dir: Option<&std::path::Path>,
     ) -> CallToolResult {
+        self.shell_with_cwd_and_sandbox(params, working_dir, None)
+            .await
+    }
+
+    pub async fn shell_with_cwd_and_sandbox(
+        &self,
+        params: ShellParams,
+        working_dir: Option<&std::path::Path>,
+        sandbox: Option<&dyn crate::sandbox::SandboxBackend>,
+    ) -> CallToolResult {
         if params.command.trim().is_empty() {
             return Self::error_result("Command cannot be empty.", None);
         }
@@ -369,6 +379,7 @@ impl ShellTool {
             params.timeout_secs,
             working_dir,
             login_path_ref,
+            sandbox,
         )
         .await
         {
@@ -496,7 +507,7 @@ impl ShellTool {
     }
 }
 
-struct ExecutionOutput {
+pub(crate) struct ExecutionOutput {
     /// Lines in arrival order, tagged by source: (is_stderr, text)
     lines: Vec<(bool, String)>,
     exit_code: Option<i32>,
@@ -505,13 +516,25 @@ struct ExecutionOutput {
     output_collection_error: Option<String>,
 }
 
+pub(crate) async fn run_command_for_verify(
+    command_line: &str,
+    timeout_secs: Option<u64>,
+    working_dir: Option<&std::path::Path>,
+    sandbox: Option<&dyn crate::sandbox::SandboxBackend>,
+) -> Result<(Option<i32>, String, String), String> {
+    let execution = run_command(command_line, timeout_secs, working_dir, None, sandbox).await?;
+    let (stdout, stderr, _) = split_lines(&execution.lines);
+    Ok((execution.exit_code, stdout, stderr))
+}
+
 async fn run_command(
     command_line: &str,
     timeout_secs: Option<u64>,
     working_dir: Option<&std::path::Path>,
     login_path: Option<&str>,
+    sandbox: Option<&dyn crate::sandbox::SandboxBackend>,
 ) -> Result<ExecutionOutput, String> {
-    let mut command = build_shell_command(command_line, working_dir, login_path);
+    let mut command = build_shell_command(command_line, working_dir, login_path, sandbox);
 
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
@@ -600,7 +623,22 @@ fn build_shell_command(
     command_line: &str,
     working_dir: Option<&std::path::Path>,
     login_path: Option<&str>,
+    sandbox: Option<&dyn crate::sandbox::SandboxBackend>,
 ) -> tokio::process::Command {
+    if let Some(backend) = sandbox {
+        if let Ok(prepared) = backend.wrap_command(command_line, working_dir) {
+            let mut command = tokio::process::Command::new(prepared.program);
+            command.args(prepared.args);
+            for (k, v) in prepared.envs {
+                command.env(k, v);
+            }
+            if let Some(dir) = prepared.cwd {
+                command.current_dir(dir);
+            }
+            command.set_no_window();
+            return command;
+        }
+    }
     #[cfg(windows)]
     let mut command = {
         let shell = windows_shell();
