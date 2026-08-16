@@ -101,6 +101,14 @@ impl GooseAcpAgent {
         self.on_import_app(req).await
     }
 
+    #[custom_method(AppsDeleteRequest)]
+    async fn dispatch_delete_app(
+        &self,
+        req: AppsDeleteRequest,
+    ) -> Result<AppsDeleteResponse, agent_client_protocol::Error> {
+        self.on_delete_app(req).await
+    }
+
     #[custom_method(UpdateWorkingDirRequest)]
     async fn dispatch_update_working_dir(
         &self,
@@ -297,6 +305,14 @@ impl GooseAcpAgent {
         req: RefreshProviderInventoryRequest,
     ) -> Result<RefreshProviderInventoryResponse, agent_client_protocol::Error> {
         self.on_refresh_provider_inventory(req).await
+    }
+
+    #[custom_method(ProviderReadinessCheckRequest)]
+    async fn dispatch_check_provider_readiness(
+        &self,
+        req: ProviderReadinessCheckRequest,
+    ) -> Result<ProviderReadinessCheckResponse, agent_client_protocol::Error> {
+        self.on_check_provider_readiness(req).await
     }
 
     #[custom_method(ProviderConfigReadRequest)]
@@ -873,6 +889,14 @@ impl GooseAcpAgent {
         req: LocalInferenceModelDeleteRequest,
     ) -> Result<EmptyResponse, agent_client_protocol::Error> {
         self.on_local_inference_model_delete(req).await
+    }
+
+    #[custom_method(LocalInferenceModelEvictRequest)]
+    async fn dispatch_local_inference_model_evict(
+        &self,
+        req: LocalInferenceModelEvictRequest,
+    ) -> Result<EmptyResponse, agent_client_protocol::Error> {
+        self.on_local_inference_model_evict(req).await
     }
 
     #[custom_method(LocalInferenceModelSettingsReadRequest)]

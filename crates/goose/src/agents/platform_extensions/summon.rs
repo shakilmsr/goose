@@ -28,8 +28,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use goose_sdk_types::custom_requests::{SourceEntry, SourceType};
 use rmcp::model::{
-    CallToolResult, Content, Implementation, InitializeResult, JsonObject, ListToolsResult, Meta,
-    ServerCapabilities, ServerNotification, Tool,
+    CallToolResult, ContentBlock, Implementation, InitializeResult, JsonObject, ListToolsResult,
+    MetaObject, ServerCapabilities, ServerNotification, Tool,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -160,10 +160,27 @@ pub struct CompletedTask {
     pub completed_at: Instant,
 }
 
+fn merge_subrecipe_parameters(
+    fixed_values: Option<&HashMap<String, String>>,
+    provided_parameters: Option<&HashMap<String, serde_json::Value>>,
+) -> HashMap<String, String> {
+    let mut merged = fixed_values.cloned().unwrap_or_default();
+    if let Some(provided_parameters) = provided_parameters {
+        for (key, value) in provided_parameters {
+            let value = match value {
+                serde_json::Value::String(value) => value.clone(),
+                other => other.to_string(),
+            };
+            merged.entry(key.clone()).or_insert(value);
+        }
+    }
+    merged
+}
+
 /// Result from handle_load_task_result with structured metadata for the caller
 #[derive(Debug)]
 struct TaskLoadResult {
-    content: Vec<Content>,
+    content: Vec<ContentBlock>,
     status: &'static str,
     turns: Option<u32>,
     duration_secs: Option<u64>,
@@ -549,6 +566,36 @@ impl SummonClient {
             completed_tasks: Mutex::new(HashMap::new()),
             notification_subscribers: Arc::new(Mutex::new(Vec::new())),
         })
+    }
+
+    async fn create_subagent_session(
+        &self,
+        task_config: &TaskConfig,
+        name: String,
+    ) -> Result<crate::session::Session, String> {
+        let session = self
+            .context
+            .session_manager
+            .create_session(
+                task_config.parent_working_dir.clone(),
+                name,
+                SessionType::SubAgent,
+                GooseMode::Auto,
+            )
+            .await
+            .map_err(|e| format!("Failed to create subagent session: {}", e))?;
+
+        if !task_config.parent_session_id.is_empty() {
+            self.context
+                .session_manager
+                .update(&session.id)
+                .parent_session_id(Some(task_config.parent_session_id.clone()))
+                .apply()
+                .await
+                .map_err(|e| format!("Failed to link subagent to parent session: {}", e))?;
+        }
+
+        Ok(session)
     }
 
     fn spawn_notification_bridge(
@@ -1161,17 +1208,10 @@ impl SummonClient {
     ) -> Result<Option<SourceEntry>, String> {
         let sources = self.get_sources(session_id, working_dir).await;
 
-        if let Some(mut source) = sources.iter().find(|s| s.name == name).cloned() {
-            if source.source_type == SourceType::Subrecipe && source.content.is_empty() {
-                source.content = self.load_subrecipe_content(session_id, &source.name).await;
-            }
-            return Ok(Some(source));
-        }
-
-        Ok(None)
+        Ok(sources.iter().find(|s| s.name == name).cloned())
     }
 
-    async fn load_subrecipe_content(&self, session_id: &str, name: &str) -> String {
+    async fn load_subrecipe_content(&self, session_id: &str, name: &str) -> Result<String, String> {
         let session = match self
             .context
             .session_manager
@@ -1179,35 +1219,36 @@ impl SummonClient {
             .await
         {
             Ok(s) => s,
-            Err(_) => return String::new(),
+            Err(_) => return Ok(String::new()),
         };
 
         let sub_recipes = match session.recipe.as_ref().and_then(|r| r.sub_recipes.as_ref()) {
             Some(sr) => sr,
-            None => return String::new(),
+            None => return Ok(String::new()),
         };
 
         let sr = match sub_recipes.iter().find(|sr| sr.name == name) {
             Some(sr) => sr,
-            None => return String::new(),
+            None => return Ok(String::new()),
         };
 
         match load_local_recipe_file(&sr.path) {
-            Ok(recipe_file) => match Recipe::from_content(&recipe_file.content) {
-                Ok(recipe) => {
-                    let mut content = recipe.instructions.unwrap_or_default();
-                    if let Some(params) = &recipe.parameters {
-                        if !params.is_empty() {
-                            content.push_str("\n\n");
-                            content.push_str(&Self::format_parameters(params));
-                        }
-                    }
-                    content
-                }
-                Err(_) => recipe_file.content,
-            },
-            Err(_) => String::new(),
+            Ok(recipe_file) => Self::format_subrecipe_content(name, &recipe_file.content),
+            Err(_) => Ok(String::new()),
         }
+    }
+
+    fn format_subrecipe_content(name: &str, raw_content: &str) -> Result<String, String> {
+        let recipe = Recipe::from_content(raw_content)
+            .map_err(|_| format!("Subrecipe '{}' is not a valid recipe", name))?;
+        let mut content = recipe.instructions.unwrap_or_default();
+        if let Some(params) = &recipe.parameters {
+            if !params.is_empty() {
+                content.push_str("\n\n");
+                content.push_str(&Self::format_parameters(params));
+            }
+        }
+        Ok(content)
     }
 
     fn discover_filesystem_sources(&self, working_dir: &Path) -> Vec<SourceEntry> {
@@ -1339,7 +1380,7 @@ impl SummonClient {
 
         if is_session_id(name) || is_registered_task {
             let task_result = self.handle_load_task_result(name, cancel, peek).await?;
-            let mut meta = Meta::new();
+            let mut meta = MetaObject::new();
             meta.0.insert(
                 "subagent_session_id".to_string(),
                 serde_json::Value::String(name.to_string()),
@@ -1412,7 +1453,7 @@ impl SummonClient {
                 Err(error) => format!("Error: {}", error),
             };
             return Ok(TaskLoadResult {
-                content: vec![Content::text(format!(
+                content: vec![ContentBlock::text(format!(
                     "# Background Task Result: {}\n\n\
                      **Task:** {}\n\
                      **Status:** {}\n\
@@ -1462,7 +1503,7 @@ impl SummonClient {
                 }
 
                 return Ok(TaskLoadResult {
-                    content: vec![Content::text(output)],
+                    content: vec![ContentBlock::text(output)],
                     status: "running",
                     turns: Some(turns_taken),
                     duration_secs: Some(elapsed.as_secs()),
@@ -1494,7 +1535,7 @@ impl SummonClient {
                 };
 
                 return Ok(TaskLoadResult {
-                    content: vec![Content::text(format!(
+                    content: vec![ContentBlock::text(format!(
                         "# Background Task Result: {}\n\n\
                          **Task:** {}\n\
                          **Status:** ⊘ Cancelled\n\
@@ -1546,7 +1587,7 @@ impl SummonClient {
                         _ => "✗ Failed",
                     };
                     return Ok(TaskLoadResult {
-                        content: vec![Content::text(format!(
+                        content: vec![ContentBlock::text(format!(
                             "# Background Task Result: {}\n\n\
                              **Task:** {}\n\
                              **Status:** {}\n\
@@ -1583,7 +1624,7 @@ impl SummonClient {
         &self,
         session_id: &str,
         working_dir: &Path,
-    ) -> Result<Vec<Content>, String> {
+    ) -> Result<Vec<ContentBlock>, String> {
         {
             let mut cache = self.source_cache.lock().await;
             *cache = None;
@@ -1593,7 +1634,7 @@ impl SummonClient {
         let completed = self.completed_tasks.lock().await;
 
         if sources.is_empty() && completed.is_empty() {
-            return Ok(vec![Content::text(
+            return Ok(vec![ContentBlock::text(
                 "No sources available for load/swarm_execute.\n\n\
                  Sources are discovered from:\n\
                  • Current recipe's sub_recipes\n\
@@ -1639,7 +1680,7 @@ impl SummonClient {
         output.push_str("\nUse load(source: \"name\") to load into context.\n");
         output.push_str("Use swarm_execute(source: \"name\", task: \"...\") to run as subagent.");
 
-        Ok(vec![Content::text(output)])
+        Ok(vec![ContentBlock::text(output)])
     }
 
     async fn handle_load_source(
@@ -1647,11 +1688,16 @@ impl SummonClient {
         session_id: &str,
         name: &str,
         working_dir: &Path,
-    ) -> Result<Vec<Content>, String> {
+    ) -> Result<Vec<ContentBlock>, String> {
         let source = self.resolve_source(session_id, name, working_dir).await?;
 
         match source {
-            Some(source) => {
+            Some(mut source) => {
+                if source.source_type == SourceType::Subrecipe && source.content.is_empty() {
+                    source.content = self
+                        .load_subrecipe_content(session_id, &source.name)
+                        .await?;
+                }
                 let content = source.to_load_text();
 
                 let output = format!(
@@ -1659,7 +1705,7 @@ impl SummonClient {
                     source.name, source.source_type, content
                 );
 
-                Ok(vec![Content::text(output)])
+                Ok(vec![ContentBlock::text(output)])
             }
             None => {
                 let sources = self.get_sources(session_id, working_dir).await;
@@ -1692,7 +1738,150 @@ impl SummonClient {
         }
     }
 
-    fn build_adhoc_recipe(&self, params: &SubagentParams) -> Result<Recipe, String> {
+    async fn handle_delegate(
+        &self,
+        session_id: &str,
+        arguments: Option<JsonObject>,
+        cancellation_token: CancellationToken,
+    ) -> Result<CallToolResult, String> {
+        self.cleanup_completed_tasks().await;
+
+        let params: DelegateParams = arguments
+            .map(|args| serde_json::from_value(serde_json::Value::Object(args)))
+            .transpose()
+            .map_err(|e| format!("Invalid parameters: {}", e))?
+            .unwrap_or_default();
+
+        self.validate_delegate_params(&params)?;
+
+        let session = self
+            .context
+            .session_manager
+            .get_session(session_id, false)
+            .await
+            .map_err(|e| format!("Failed to get session: {}", e))?;
+
+        if session.session_type == SessionType::SubAgent {
+            return Err("Delegated tasks cannot spawn further delegations".to_string());
+        }
+
+        if params.r#async {
+            let (content, task_id) = self.handle_async_delegate(session_id, params).await?;
+            let mut meta = MetaObject::new();
+            meta.0.insert(
+                "subagent_session_id".to_string(),
+                serde_json::Value::String(task_id),
+            );
+            return Ok(CallToolResult::success(content).with_meta(Some(meta)));
+        }
+
+        let working_dir = session.working_dir.clone();
+        let recipe = self
+            .build_delegate_recipe(&params, session_id, &working_dir)
+            .await?;
+
+        let task_config = self
+            .build_task_config(&params, &recipe, &session)
+            .await
+            .map_err(|e| format!("Failed to build task config: {}", e))?;
+
+        // Subagents must use Auto until get_agent_messages forwards
+        // ActionRequired messages to the parent. Until then, any mode
+        // that requires approval will hang on the subagent's confirmation_rx.
+        let mut agent_config = AgentConfig::new(
+            self.context.session_manager.clone(),
+            crate::config::permission::PermissionManager::instance(),
+            None,
+            GooseMode::Auto,
+            true, // disable session naming for subagents
+            crate::agents::GoosePlatform::GooseCli,
+        )
+        .with_use_login_shell_path(self.context.use_login_shell_path);
+        agent_config.is_subagent = true;
+
+        let subagent_session = self
+            .create_subagent_session(&task_config, "Delegated task".to_string())
+            .await?;
+
+        let (notif_tx, notif_rx) = tokio::sync::mpsc::unbounded_channel::<ServerNotification>();
+        Self::spawn_notification_bridge(
+            notif_rx,
+            Arc::clone(&self.notification_subscribers),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+
+        let subagent_session_id = subagent_session.id.clone();
+
+        let result = run_subagent_task(SubagentRunParams {
+            config: agent_config,
+            recipe,
+            task_config,
+            return_last_only: true,
+            session_id: subagent_session.id,
+            cancellation_token: Some(cancellation_token),
+            on_message: None,
+            notification_tx: Some(notif_tx),
+        })
+        .await;
+
+        let mut meta = MetaObject::new();
+        meta.0.insert(
+            "subagent_session_id".to_string(),
+            serde_json::Value::String(subagent_session_id),
+        );
+
+        match result {
+            Ok(text) => {
+                Ok(CallToolResult::success(vec![ContentBlock::text(text)]).with_meta(Some(meta)))
+            }
+            Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                "Delegation failed: {}",
+                e
+            ))])
+            .with_meta(Some(meta))),
+        }
+    }
+
+    fn validate_delegate_params(&self, params: &DelegateParams) -> Result<(), String> {
+        if params.instructions.is_none() && params.source.is_none() {
+            return Err("Must provide 'instructions' or 'source' (or both)".to_string());
+        }
+
+        if params.parameters.is_some() && params.source.is_none() {
+            return Err("'parameters' can only be used with 'source'".to_string());
+        }
+
+        if let Some(max) = params.max_turns {
+            if max < 1 {
+                return Err("'max_turns' must be at least 1".to_string());
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn build_delegate_recipe(
+        &self,
+        params: &DelegateParams,
+        session_id: &str,
+        working_dir: &Path,
+    ) -> Result<Recipe, String> {
+        let mut recipe = if let Some(source_name) = &params.source {
+            self.build_source_recipe(source_name, params, session_id, working_dir)
+                .await?
+        } else {
+            self.build_adhoc_recipe(params)?
+        };
+
+        if let Some(ref context) = params.context {
+            let existing = recipe.instructions.unwrap_or_default();
+            recipe.instructions = Some(build_instructions_with_context(context, &existing));
+        }
+
+        Ok(recipe)
+    }
+
+    fn build_adhoc_recipe(&self, params: &DelegateParams) -> Result<Recipe, String> {
         let task = params
             .instructions
             .as_ref()
@@ -1772,21 +1961,8 @@ impl SummonClient {
                         format!("Failed to load subrecipe '{}': {}", source.name, e)
                     })?;
 
-                    let mut merged: HashMap<String, String> = HashMap::new();
-                    if let Some(values) = &sr.values {
-                        for (k, v) in values {
-                            merged.insert(k.clone(), v.clone());
-                        }
-                    }
-                    if let Some(provided_params) = &params.parameters {
-                        for (k, v) in provided_params {
-                            let value_str = match v {
-                                serde_json::Value::String(s) => s.clone(),
-                                other => other.to_string(),
-                            };
-                            merged.insert(k.clone(), value_str);
-                        }
-                    }
+                    let merged =
+                        merge_subrecipe_parameters(sr.values.as_ref(), params.parameters.as_ref());
                     let param_values: Vec<(String, String)> = merged.into_iter().collect();
 
                     return build_recipe_from_template(
@@ -1881,8 +2057,6 @@ impl SummonClient {
         recipe: &Recipe,
         session: &crate::session::Session,
     ) -> Result<TaskConfig, anyhow::Error> {
-        let (provider, model_config) = self.resolve_provider(params, recipe, session).await?;
-
         let mut extensions = EnabledExtensionsState::extensions_or_default(
             Some(&session.extension_data),
             Config::global(),
@@ -1908,6 +2082,10 @@ impl SummonClient {
                 }
             }
         }
+
+        let (provider, model_config) = self
+            .resolve_provider(params, recipe, session, &extensions)
+            .await?;
 
         let max_turns = params
             .max_turns
@@ -1961,7 +2139,21 @@ impl SummonClient {
             });
 
         if let Some(model) = override_model {
-            model_config = override_model_config(&model_config, provider_name, &model)?;
+            if model != model_config.model_name {
+                let parent = model_config;
+                let mut cfg =
+                    crate::model_config::model_config_from_user_config_with_session_settings(
+                        provider_name,
+                        &model,
+                        Some(&parent),
+                        None,
+                        None,
+                    )?;
+                cfg.toolshim = parent.toolshim;
+                cfg.toolshim_model = parent.toolshim_model;
+                cfg.temperature = cfg.temperature.or(parent.temperature);
+                model_config = cfg;
+            }
         }
 
         if let Some(temp) = params.temperature {
@@ -2011,7 +2203,31 @@ impl SummonClient {
     > {
         let provider_name = self.resolve_provider_name(params, recipe, session)?;
         let model_config = self.resolve_model_config(params, recipe, session, &provider_name)?;
-        let provider = providers::create(&provider_name, Vec::new()).await?;
+        let provider = match providers::get_from_registry(&provider_name).await {
+            Ok(entry) => entry.create(extensions.to_vec()).await?,
+            Err(error) => {
+                let parent_provider = if let Some(extension_manager) = self
+                    .context
+                    .extension_manager
+                    .as_ref()
+                    .and_then(|weak| weak.upgrade())
+                {
+                    extension_manager.get_provider().lock().await.clone()
+                } else {
+                    None
+                };
+
+                match parent_provider {
+                    Some(provider)
+                        if provider.get_name() == provider_name
+                            && !provider.manages_own_context() =>
+                    {
+                        provider
+                    }
+                    _ => return Err(error),
+                }
+            }
+        };
         Ok((provider, model_config))
     }
 
@@ -2129,6 +2345,7 @@ impl SwarmModels {
     /// subtask the way a hard error mid-graph would.
     fn resolve(
         &self,
+<<<<<<< HEAD
         pinned: Option<&str>,
         tier: Tier,
         subtask_id: &str,
@@ -2350,6 +2567,17 @@ impl AgentSpawner for SummonAgentSpawner {
                 "\nYour declared write lanes in the repository are: {}. Do not write \
                  repository paths outside these lanes.",
                 subtask.workspace_writes.join(", ")
+=======
+        session_id: &str,
+        params: DelegateParams,
+    ) -> Result<(Vec<ContentBlock>, String), String> {
+        let task_count = self.background_tasks.lock().await.len();
+        let max_tasks = max_background_tasks();
+        if task_count >= max_tasks {
+            return Err(format!(
+                "Maximum {} background tasks already running. Wait for completion or use sync mode.",
+                max_tasks
+>>>>>>> upstream/main
             ));
         }
 
@@ -2384,14 +2612,35 @@ impl AgentSpawner for SummonAgentSpawner {
             }),
         });
 
+<<<<<<< HEAD
         let agent_config = AgentConfig::new(
             self.session_manager.clone(),
+=======
+        let working_dir = session.working_dir.clone();
+        let recipe = self
+            .build_delegate_recipe(&params, session_id, &working_dir)
+            .await?;
+
+        let task_config = self
+            .build_task_config(&params, &recipe, &session)
+            .await
+            .map_err(|e| format!("Failed to build task config: {}", e))?;
+
+        let description = safe_truncate(&Self::get_task_description(&params), TASK_LABEL_BUDGET);
+
+        // Subagents must use Auto until get_agent_messages forwards
+        // ActionRequired messages to the parent. Until then, any mode
+        // that requires approval will hang on the subagent's confirmation_rx.
+        let mut agent_config = AgentConfig::new(
+            self.context.session_manager.clone(),
+>>>>>>> upstream/main
             crate::config::permission::PermissionManager::instance(),
             None,
             GooseMode::Auto,
             true, // disable session naming for subagents
             crate::agents::GoosePlatform::GooseCli,
         )
+<<<<<<< HEAD
         .with_use_login_shell_path(self.use_login_shell_path);
 
         let subagent_session = self
@@ -2407,6 +2656,14 @@ impl AgentSpawner for SummonAgentSpawner {
             )
             .await
             .map_err(|e| anyhow::anyhow!("Failed to create subagent session: {}", e))?;
+=======
+        .with_use_login_shell_path(self.context.use_login_shell_path);
+        agent_config.is_subagent = true;
+
+        let subagent_session = self
+            .create_subagent_session(&task_config, description.clone())
+            .await?;
+>>>>>>> upstream/main
 
         let mut task_config = self.scoped_task_config(subtask);
         if let Some(cfg) = self.models.resolve(
@@ -2441,6 +2698,7 @@ impl AgentSpawner for SummonAgentSpawner {
         } else {
             (interpret_subtask_output(&raw), None)
         };
+<<<<<<< HEAD
         match outcome {
             SubtaskOutcome::Success(output) => Ok(SubtaskResult {
                 output,
@@ -2453,6 +2711,20 @@ impl AgentSpawner for SummonAgentSpawner {
                 reason
             )),
         }
+=======
+
+        self.background_tasks
+            .lock()
+            .await
+            .insert(task_id.clone(), task);
+
+        let content = vec![ContentBlock::text(format!(
+            "Task {} started in background: \"{}\"\n\
+             Continue with other work. When you need the result, use load(source: \"{}\").",
+            task_id, description, task_id
+        ))];
+        Ok((content, task_id))
+>>>>>>> upstream/main
     }
 
     fn prompt_token_budget(&self, subtask: &SubTask) -> Option<usize> {
@@ -2544,6 +2816,7 @@ impl McpClientTrait for SummonClient {
             tools,
             next_cursor: None,
             meta: None,
+            ..Default::default()
         })
     }
 
@@ -2558,7 +2831,7 @@ impl McpClientTrait for SummonClient {
         match name {
             "load" => match self.handle_load(session_id, arguments).await {
                 Ok(result) => Ok(result),
-                Err(error) => Ok(CallToolResult::error(vec![Content::text(format!(
+                Err(error) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                     "Error: {}",
                     error
                 ))])),
@@ -2569,13 +2842,13 @@ impl McpClientTrait for SummonClient {
                     .await
                 {
                     Ok(result) => Ok(result),
-                    Err(error) => Ok(CallToolResult::error(vec![Content::text(format!(
+                    Err(error) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                         "Error: {}",
                         error
                     ))])),
                 }
             }
-            _ => Ok(CallToolResult::error(vec![Content::text(format!(
+            _ => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                 "Error: Unknown tool: {}",
                 name
             ))])),
@@ -2703,6 +2976,7 @@ mod tests {
         PlatformExtensionContext {
             extension_manager: None,
             session_manager: Arc::new(crate::session::SessionManager::instance()),
+            scheduler: None,
             session: None,
             use_login_shell_path: false,
         }
@@ -2930,6 +3204,37 @@ You review code."#;
         assert!(text.contains("now available in your context"));
     }
 
+    #[test]
+    fn test_invalid_external_subrecipe_content_is_not_returned() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("invalid.yaml");
+        fs::write(&path, "api_key: SUPERSECRET\n").unwrap();
+
+        let recipe_file = load_local_recipe_file(path.to_str().unwrap()).unwrap();
+        let error =
+            SummonClient::format_subrecipe_content("invalid", &recipe_file.content).unwrap_err();
+
+        assert_eq!(error, "Subrecipe 'invalid' is not a valid recipe");
+        assert!(!error.contains("SUPERSECRET"));
+    }
+
+    #[test]
+    fn test_valid_external_subrecipe_content_still_loads() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("child.yaml");
+        fs::write(
+            &path,
+            "title: Child\ndescription: External child\ninstructions: Run child steps",
+        )
+        .unwrap();
+
+        let recipe_file = load_local_recipe_file(path.to_str().unwrap()).unwrap();
+        let content =
+            SummonClient::format_subrecipe_content("child", &recipe_file.content).unwrap();
+
+        assert_eq!(content, "Run child steps");
+    }
+
     #[tokio::test]
     async fn test_load_agent_source() {
         let temp_dir = TempDir::new().unwrap();
@@ -3025,6 +3330,123 @@ You review code."#;
     }
 
     #[test]
+<<<<<<< HEAD
+=======
+    fn test_task_description_formatting() {
+        let make_params = |source: Option<&str>, instructions: Option<&str>| DelegateParams {
+            source: source.map(String::from),
+            instructions: instructions.map(String::from),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            SummonClient::get_task_description(&make_params(Some("recipe"), None)),
+            "recipe"
+        );
+        assert_eq!(
+            SummonClient::get_task_description(&make_params(None, Some("do stuff"))),
+            "do stuff"
+        );
+        assert_eq!(
+            SummonClient::get_task_description(&make_params(Some("r"), Some("task"))),
+            "r: task"
+        );
+        assert_eq!(
+            SummonClient::get_task_description(&make_params(None, None)),
+            "Unknown task"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_context_injected_into_adhoc_recipe() {
+        let temp_dir = TempDir::new().unwrap();
+        let client = SummonClient::new(create_test_context()).unwrap();
+
+        let params = DelegateParams {
+            instructions: Some("do the task".to_string()),
+            context: Some("background info".to_string()),
+            ..Default::default()
+        };
+
+        let recipe = client
+            .build_delegate_recipe(&params, "test", temp_dir.path())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            recipe.instructions.as_deref(),
+            Some("# Reference Context\n\nbackground info")
+        );
+        assert_eq!(recipe.prompt.as_deref(), Some("do the task"));
+    }
+
+    #[test]
+    fn test_subrecipe_fixed_values_take_precedence_over_delegate_parameters() {
+        let fixed = HashMap::from([("fixed".to_string(), "parent-value".to_string())]);
+        let provided = HashMap::from([
+            (
+                "fixed".to_string(),
+                serde_json::Value::String("delegate-value".to_string()),
+            ),
+            (
+                "caller".to_string(),
+                serde_json::Value::String("caller-value".to_string()),
+            ),
+        ]);
+
+        let merged = merge_subrecipe_parameters(Some(&fixed), Some(&provided));
+
+        assert_eq!(
+            merged.get("fixed").map(String::as_str),
+            Some("parent-value")
+        );
+        assert_eq!(
+            merged.get("caller").map(String::as_str),
+            Some("caller-value")
+        );
+    }
+
+    #[test]
+    fn test_build_instructions_with_context_wraps_existing_instructions() {
+        assert_eq!(
+            build_instructions_with_context("background info", "Run deploy steps"),
+            "# Reference Context\n\nbackground info\n\n# Task Instructions\n\nRun deploy steps"
+        );
+        assert_eq!(
+            build_instructions_with_context("background info", ""),
+            "# Reference Context\n\nbackground info"
+        );
+    }
+
+    #[test]
+    fn test_validate_delegate_params_rejects_zero_max_turns() {
+        let context = create_test_context();
+        let client = SummonClient::new(context).unwrap();
+
+        let params = DelegateParams {
+            instructions: Some("do something".to_string()),
+            max_turns: Some(0),
+            ..Default::default()
+        };
+        let result = client.validate_delegate_params(&params);
+        assert_eq!(result, Err("'max_turns' must be at least 1".to_string()));
+    }
+
+    #[test]
+    fn test_validate_delegate_params_accepts_positive_max_turns() {
+        let context = create_test_context();
+        let client = SummonClient::new(context).unwrap();
+
+        let params = DelegateParams {
+            instructions: Some("do something".to_string()),
+            max_turns: Some(5),
+            ..Default::default()
+        };
+        assert!(client.validate_delegate_params(&params).is_ok());
+    }
+
+    #[test]
+>>>>>>> upstream/main
     #[serial]
     fn test_resolve_max_turns_recipe_overrides_env_var() {
         let context = create_test_context();
@@ -3119,6 +3541,78 @@ You review code."#;
         }
     }
 
+    #[tokio::test]
+    async fn test_resolve_provider_reuses_unregistered_parent_provider() {
+        let temp_dir = TempDir::new().unwrap();
+        let parent_provider: Arc<dyn crate::providers::base::Provider> = Arc::new(
+            crate::providers::testprovider::TestProvider::new_replaying(
+                temp_dir.path().join("records.json").display().to_string(),
+            )
+            .unwrap(),
+        );
+        let extension_manager = Arc::new(
+            crate::agents::extension_manager::ExtensionManager::new_without_provider(
+                temp_dir.path().to_path_buf(),
+            ),
+        );
+        *extension_manager.get_provider().lock().await = Some(Arc::clone(&parent_provider));
+        let mut context = extension_manager.get_context().clone();
+        context.extension_manager = Some(Arc::downgrade(&extension_manager));
+        let client = SummonClient::new(context).unwrap();
+        let session = crate::session::Session {
+            provider_name: Some(parent_provider.get_name().to_string()),
+            model_config: Some(goose_providers::model::ModelConfig::new("test-model")),
+            ..Default::default()
+        };
+
+        let params = DelegateParams {
+            provider: Some(parent_provider.get_name().to_string()),
+            model: Some("test-model".to_string()),
+            ..Default::default()
+        };
+        let (resolved_provider, _) = client
+            .resolve_provider(&params, &empty_recipe(), &session, &[])
+            .await
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&parent_provider, &resolved_provider));
+    }
+
+    #[tokio::test]
+    async fn test_build_task_config_recreates_registered_parent_provider() {
+        let temp_dir = TempDir::new().unwrap();
+        let parent_provider = providers::create("openai", Vec::new()).await.unwrap();
+        let extension_manager = Arc::new(
+            crate::agents::extension_manager::ExtensionManager::new_without_provider(
+                temp_dir.path().to_path_buf(),
+            ),
+        );
+        *extension_manager.get_provider().lock().await = Some(Arc::clone(&parent_provider));
+        let mut context = extension_manager.get_context().clone();
+        context.extension_manager = Some(Arc::downgrade(&extension_manager));
+        let client = SummonClient::new(context).unwrap();
+        let session = crate::session::Session {
+            provider_name: Some(parent_provider.get_name().to_string()),
+            model_config: Some(goose_providers::model::ModelConfig::new("test-model")),
+            working_dir: temp_dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let params = DelegateParams {
+            extensions: Some(Vec::new()),
+            provider: Some(parent_provider.get_name().to_string()),
+            model: Some("test-model".to_string()),
+            ..Default::default()
+        };
+
+        let task_config = client
+            .build_task_config(&params, &empty_recipe(), &session)
+            .await
+            .unwrap();
+
+        assert!(!Arc::ptr_eq(&parent_provider, &task_config.provider));
+        assert!(task_config.extensions.is_empty());
+    }
+
     const PARENT_MODEL: &str = "claude-3-5-sonnet-20241022";
     const OVERRIDE_MODEL: &str = "claude-opus-4-6";
     const PROVIDER: &str = "anthropic";
@@ -3174,13 +3668,17 @@ You review code."#;
 
     #[tokio::test]
     #[serial]
-    async fn test_resolve_model_config_preserves_parent_request_params_on_override() {
+    async fn test_resolve_model_config_does_not_inherit_provider_specific_request_params() {
         let _env = env_lock::lock_env([
             ("GOOSE_CONTEXT_LIMIT", None::<&str>),
             ("GOOSE_MAX_TOKENS", None::<&str>),
             ("GOOSE_SUBAGENT_MODEL", None::<&str>),
         ]);
 
+        // Parent session is a Claude model with anthropic_beta in request_params.
+        // When delegate() overrides to a different model (e.g. Gemini), provider-
+        // specific params like anthropic_beta must not bleed through — they would
+        // cause a 400 INVALID_ARGUMENT from the target API.
         let mut parent = parent_config();
         parent.request_params = Some(HashMap::from([(
             "anthropic_beta".to_string(),
@@ -3194,10 +3692,12 @@ You review code."#;
                 .request_params
                 .as_ref()
                 .and_then(|p| p.get("anthropic_beta")),
-            Some(&serde_json::json!("custom-beta-header")),
+            None,
+            "anthropic_beta must not be inherited by a child session with a different model"
         );
     }
 
+<<<<<<< HEAD
     fn swarm_params(models: Option<HashMap<String, String>>) -> SwarmExecuteParams {
         SwarmExecuteParams {
             task: "t".to_string(),
@@ -3321,6 +3821,61 @@ You review code."#;
         use rmcp::model::RawContent;
         match &content.raw {
             RawContent::Text(t) => t.text.as_str(),
+=======
+    #[tokio::test]
+    #[serial]
+    async fn test_resolve_model_config_inherits_thinking_effort_on_override() {
+        let _env = env_lock::lock_env([
+            ("GOOSE_CONTEXT_LIMIT", None::<&str>),
+            ("GOOSE_MAX_TOKENS", None::<&str>),
+            ("GOOSE_SUBAGENT_MODEL", None::<&str>),
+        ]);
+
+        // Reasoning controls are model-family-agnostic and should be inherited,
+        // while provider-specific params like anthropic_beta must not.
+        let mut parent = parent_config();
+        parent.request_params = Some(HashMap::from([
+            ("thinking_effort".to_string(), serde_json::json!("high")),
+            ("budget_tokens".to_string(), serde_json::json!(8192)),
+            (
+                "anthropic_beta".to_string(),
+                serde_json::json!("custom-beta-header"),
+            ),
+        ]));
+
+        let resolved = resolve_with_override(Some(OVERRIDE_MODEL), parent);
+
+        assert_eq!(
+            resolved
+                .request_params
+                .as_ref()
+                .and_then(|p| p.get("thinking_effort")),
+            Some(&serde_json::json!("high")),
+            "thinking_effort should be inherited across model families"
+        );
+        assert_eq!(
+            resolved
+                .request_params
+                .as_ref()
+                .and_then(|p| p.get("budget_tokens")),
+            Some(&serde_json::json!(8192)),
+            "budget_tokens should be inherited across model families"
+        );
+        assert_eq!(
+            resolved
+                .request_params
+                .as_ref()
+                .and_then(|p| p.get("anthropic_beta")),
+            None,
+            "anthropic_beta must not be inherited alongside reasoning controls"
+        );
+    }
+
+    fn extract_text(content: &ContentBlock) -> &str {
+        use rmcp::model::ContentBlock;
+        match content {
+            ContentBlock::Text(t) => t.text.as_str(),
+>>>>>>> upstream/main
             _ => panic!("Expected text content"),
         }
     }
@@ -3519,7 +4074,8 @@ You review code."#;
             .try_recv()
             .expect("subscriber should receive buffered notification");
         if let ServerNotification::LoggingMessageNotification(log) = notif {
-            let data = log.params.data.as_object().unwrap();
+            let params = serde_json::to_value(&log.params).unwrap();
+            let data = params.get("data").and_then(|v| v.as_object()).unwrap();
             assert_eq!(
                 data.get("subagent_id").and_then(|v| v.as_str()),
                 Some("20260204_1")

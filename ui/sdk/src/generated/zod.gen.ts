@@ -67,7 +67,7 @@ export const zMcpServerAcpId = z.string();
  */
 export const zMcpServerAcp = z.object({
     name: z.string(),
-    id: zMcpServerAcpId,
+    serverId: zMcpServerAcpId,
     _meta: z.union([
         z.record(z.unknown()),
         z.null()
@@ -175,6 +175,15 @@ export const zGooseExtension = z.union([
             z.string(),
             z.null()
         ]).optional(),
+        clientId: z.union([
+            z.string(),
+            z.null()
+        ]).optional(),
+        clientSecretKey: z.union([
+            z.string(),
+            z.null()
+        ]).optional(),
+        scopes: z.array(z.string()).optional(),
         bundled: z.union([
             z.boolean(),
             z.null()
@@ -326,6 +335,15 @@ export const zAppsImportRequest_unstable = z.object({
 });
 
 export const zAppsImportResponse_unstable = z.object({
+    name: z.string(),
+    message: z.string()
+});
+
+export const zAppsDeleteRequest_unstable = z.object({
+    name: z.string()
+});
+
+export const zAppsDeleteResponse_unstable = z.object({
     name: z.string(),
     message: z.string()
 });
@@ -767,8 +785,16 @@ export const zProviderInventoryEntryDto = z.object({
     description: z.string(),
     defaultModel: z.string(),
     configured: z.boolean(),
+    available: z.boolean(),
     providerType: z.string(),
     category: zProviderSetupCategoryDto,
+    acp: z.boolean().optional().default(false),
+    visibleInSetup: z.boolean(),
+    deprecated: z.boolean(),
+    replacement: z.union([
+        z.string(),
+        z.null()
+    ]).optional(),
     configKeys: z.array(zProviderConfigKey),
     setupSteps: z.array(z.string()),
     supportsRefresh: z.boolean(),
@@ -874,6 +900,7 @@ export const zProviderSetupCatalogEntryDto = z.object({
     providerId: z.string(),
     name: z.string(),
     category: zProviderSetupCategoryDto,
+    acp: z.boolean().optional().default(false),
     description: z.string(),
     setupMethod: zProviderSetupMethodDto,
     nativeConnectQuery: z.union([
@@ -1098,6 +1125,22 @@ export const zCustomProviderDeleteResponse_unstable = z.object({
  */
 export const zRefreshProviderInventoryRequest_unstable = z.object({
     providerIds: z.array(z.string()).optional().default([])
+});
+
+/**
+ * Check whether an ACP provider can initialize and create a session.
+ */
+export const zProviderReadinessCheckRequest_unstable = z.object({
+    providerId: z.string()
+});
+
+export const zProviderReadinessCheckResponse_unstable = z.object({
+    providerId: z.string(),
+    ready: z.boolean(),
+    error: z.union([
+        z.string(),
+        z.null()
+    ]).optional()
 });
 
 /**
@@ -1401,15 +1444,19 @@ export const zOnboardingImportApplyResponse_unstable = z.object({
     ]).optional()
 });
 
+export const zSessionExportFormat = z.enum(['json', 'markdown']);
+
 /**
- * Export a session as a JSON string.
+ * Export a session as a JSON or markdown string.
  */
 export const zExportSessionRequest_unstable = z.object({
-    sessionId: z.string()
+    sessionId: z.string(),
+    format: zSessionExportFormat.optional().default('json')
 });
 
 /**
- * Export session response — raw JSON of the goose session with `conversation`.
+ * Export session response — raw JSON of the goose session with `conversation`,
+ * or a markdown transcript when `format` is `markdown`.
  */
 export const zExportSessionResponse_unstable = z.object({
     data: z.string()
@@ -1548,6 +1595,15 @@ export const zRecipeExtensionDto = z.union([
             z.string(),
             z.null()
         ]).optional(),
+        client_id: z.union([
+            z.string(),
+            z.null()
+        ]).optional(),
+        client_secret_key: z.union([
+            z.string(),
+            z.null()
+        ]).optional(),
+        scopes: z.array(z.string()).optional(),
         bundled: z.union([
             z.boolean(),
             z.null()
@@ -2505,6 +2561,7 @@ export const zLocalInferenceModelDto = z.object({
     sizeBytes: z.number().int().gte(0),
     status: zLocalInferenceModelDownloadStatusDto,
     recommended: z.boolean(),
+    isLoaded: z.boolean(),
     settings: zLocalInferenceModelSettingsDto,
     visionCapable: z.boolean(),
     mmprojStatus: z.union([
@@ -2570,6 +2627,10 @@ export const zLocalInferenceModelDownloadCancelRequest_unstable = z.object({
 });
 
 export const zLocalInferenceModelDeleteRequest_unstable = z.object({
+    modelId: z.string()
+});
+
+export const zLocalInferenceModelEvictRequest_unstable = z.object({
     modelId: z.string()
 });
 
@@ -2699,6 +2760,70 @@ export const zStatusMessageUpdate = z.object({
 });
 
 /**
+ * Wire mirror of the conversation `CostSource`.
+ */
+export const zCostSourceData = z.union([
+    z.literal('provider_reported'),
+    z.literal('estimated')
+]);
+
+/**
+ * Wire mirror of the conversation `MessageUsage` (this crate cannot depend on
+ * goose-provider-types); field names and serde casing MUST stay in parity.
+ */
+export const zMessageUsageData = z.object({
+    inputTokens: z.union([
+        z.number().int(),
+        z.null()
+    ]).optional(),
+    outputTokens: z.union([
+        z.number().int(),
+        z.null()
+    ]).optional(),
+    totalTokens: z.union([
+        z.number().int(),
+        z.null()
+    ]).optional(),
+    cacheReadTokens: z.union([
+        z.number().int(),
+        z.null()
+    ]).optional(),
+    cacheWriteTokens: z.union([
+        z.number().int(),
+        z.null()
+    ]).optional(),
+    cost: z.union([
+        z.number(),
+        z.null()
+    ]).optional(),
+    costSource: z.union([
+        zCostSourceData,
+        z.null()
+    ]).optional(),
+    elapsedMs: z.union([
+        z.number().int().gte(0),
+        z.null()
+    ]).optional(),
+    timeToFirstTokenMs: z.union([
+        z.number().int().gte(0),
+        z.null()
+    ]).optional(),
+    isCompaction: z.boolean().optional().default(false)
+});
+
+/**
+ * Per-message token usage/cost/timing, keyed by the message id used for
+ * chunk matching. Sent live after a turn's messages and on replay.
+ */
+export const zMessageUsageUpdate = z.object({
+    messageId: z.union([
+        z.string(),
+        z.null()
+    ]).optional(),
+    usage: zMessageUsageData
+});
+
+/**
  * Discriminated union of goose-specific session update payloads.
  * Variant tag matches ACP's convention (`sessionUpdate: "<snake_case>"`).
  *
@@ -2712,7 +2837,10 @@ export const zGooseSessionUpdate = z.union([
     }).and(zSessionUsageUpdate),
     z.object({
         sessionUpdate: z.literal('status_message')
-    }).and(zStatusMessageUpdate)
+    }).and(zStatusMessageUpdate),
+    z.object({
+        sessionUpdate: z.literal('message_usage')
+    }).and(zMessageUsageUpdate)
 ]);
 
 /**
@@ -2726,7 +2854,11 @@ export const zGooseSessionNotification_unstable = z.object({
 
 export const zRequestRecipeParams_unstable = z.object({
     sessionId: z.string(),
-    parameters: z.array(zRecipeParameterDto)
+    parameters: z.array(zRecipeParameterDto),
+    parameterScopeId: z.union([
+        z.string(),
+        z.null()
+    ]).optional()
 });
 
 export const zRecipeParamsAction = z.enum(['submit', 'cancel']);
@@ -2750,6 +2882,7 @@ export const zExtRequest = z.object({
             zAppsListRequest_unstable,
             zAppsExportRequest_unstable,
             zAppsImportRequest_unstable,
+            zAppsDeleteRequest_unstable,
             zUpdateWorkingDirRequest_unstable,
             zSetSessionSystemPromptRequest_unstable,
             zSteerSessionRequest_unstable,
@@ -2775,6 +2908,7 @@ export const zExtRequest = z.object({
             zCustomProviderUpdateRequest_unstable,
             zCustomProviderDeleteRequest_unstable,
             zRefreshProviderInventoryRequest_unstable,
+            zProviderReadinessCheckRequest_unstable,
             zProviderConfigReadRequest_unstable,
             zProviderConfigStatusRequest_unstable,
             zProviderConfigSaveRequest_unstable,
@@ -2847,6 +2981,7 @@ export const zExtRequest = z.object({
             zLocalInferenceModelDownloadProgressRequest_unstable,
             zLocalInferenceModelDownloadCancelRequest_unstable,
             zLocalInferenceModelDeleteRequest_unstable,
+            zLocalInferenceModelEvictRequest_unstable,
             zLocalInferenceModelSettingsReadRequest_unstable,
             zLocalInferenceModelSettingsUpdateRequest_unstable,
             zLocalInferenceHuggingFaceSearchRequest_unstable,
@@ -2873,6 +3008,7 @@ export const zExtResponse = z.union([
                 zAppsListResponse_unstable,
                 zAppsExportResponse_unstable,
                 zAppsImportResponse_unstable,
+                zAppsDeleteResponse_unstable,
                 zSteerSessionResponse_unstable,
                 zDiagnosticsGetResponse_unstable,
                 zListPromptsResponse_unstable,
@@ -2891,6 +3027,7 @@ export const zExtResponse = z.union([
                 zCustomProviderUpdateResponse_unstable,
                 zCustomProviderDeleteResponse_unstable,
                 zRefreshProviderInventoryResponse_unstable,
+                zProviderReadinessCheckResponse_unstable,
                 zProviderConfigReadResponse_unstable,
                 zProviderConfigStatusResponse_unstable,
                 zProviderConfigChangeResponse_unstable,

@@ -17,7 +17,6 @@ use crate::commands::configure::configure_telemetry_consent_dialog;
 use crate::commands::configure::handle_configure;
 use crate::commands::info::handle_info;
 use crate::commands::plugin::{handle_plugin_install, handle_plugin_update};
-use crate::commands::project::{handle_project_default, handle_projects_interactive};
 use crate::commands::recipe::{handle_deeplink, handle_list, handle_open, handle_validate};
 use crate::commands::term::{
     handle_term_info, handle_term_init, handle_term_log, handle_term_run, Shell,
@@ -38,8 +37,6 @@ use goose::session::session_manager::SessionType;
 use goose::session::SessionManager;
 use std::io::Read;
 use std::path::PathBuf;
-use tracing::warn;
-
 const GOOSE_SERVER_SECRET_KEY_ENV: &str = "GOOSE_SERVER__SECRET_KEY";
 
 fn generate_serve_secret_key() -> String {
@@ -49,6 +46,22 @@ fn generate_serve_secret_key() -> String {
         "goose-acp-{}",
         Alphanumeric.sample_string(&mut rand::rng(), 32)
     )
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ServePlatform {
+    #[default]
+    Cli,
+    Desktop,
+}
+
+impl From<ServePlatform> for GoosePlatform {
+    fn from(platform: ServePlatform) -> Self {
+        match platform {
+            ServePlatform::Cli => GoosePlatform::GooseCli,
+            ServePlatform::Desktop => GoosePlatform::GooseDesktop,
+        }
+    }
 }
 
 #[derive(Parser)]
@@ -314,7 +327,7 @@ impl Default for OutputOptions {
     }
 }
 
-/// Model/provider override options for the run command
+/// Model/provider override options
 #[derive(Args, Debug, Clone, Default)]
 pub struct ModelOptions {
     /// Provider to use for this run (overrides environment variable)
@@ -398,7 +411,9 @@ async fn get_or_create_session_id(
 
     let resolved_id = if resume {
         let Some(id) = identifier else {
-            let sessions = session_manager.list_sessions().await?;
+            let sessions = session_manager
+                .list_sessions_by_types(&[SessionType::User])
+                .await?;
             let session_id = sessions
                 .first()
                 .map(|s| s.id.clone())
@@ -826,6 +841,9 @@ enum Command {
             value_delimiter = ','
         )]
         builtins: Vec<String>,
+
+        #[arg(long, help = "Enable scheduled recipe execution")]
+        enable_scheduler: bool,
     },
 
     /// Start ACP server over HTTP and WebSocket
@@ -846,6 +864,9 @@ enum Command {
         #[arg(long = "tls-key-path", value_name = "PATH")]
         tls_key_path: Option<String>,
 
+        #[arg(long, value_enum, default_value_t = ServePlatform::Cli)]
+        platform: ServePlatform,
+
         #[arg(
             long = "with-builtin",
             value_name = "NAME",
@@ -855,6 +876,23 @@ enum Command {
             action = clap::ArgAction::Append
         )]
         builtins: Vec<String>,
+
+        #[arg(
+            long = "dangerously-unauthenticated",
+            help = "Start the ACP endpoint without requiring GOOSE_SERVER__SECRET_KEY"
+        )]
+        dangerously_unauthenticated: bool,
+
+        #[arg(
+            long = "allowed-origin",
+            value_name = "ORIGIN",
+            action = clap::ArgAction::Append,
+            help = "Allow an exact Origin value for ACP CORS; may be specified multiple times and replaces the default loopback origins"
+        )]
+        allowed_origins: Vec<String>,
+
+        #[arg(long, help = "Enable scheduled recipe execution")]
+        enable_scheduler: bool,
     },
 
     /// Start or resume interactive chat sessions
@@ -909,15 +947,10 @@ enum Command {
 
         #[command(flatten)]
         extension_opts: ExtensionOptions,
+
+        #[command(flatten)]
+        model_opts: ModelOptions,
     },
-
-    /// Open the last project directory
-    #[command(about = "Open the last project directory", visible_alias = "p")]
-    Project {},
-
-    /// List recent project directories
-    #[command(about = "List recent project directories", visible_alias = "ps")]
-    Projects,
 
     /// Execute commands from an instruction file
     #[command(about = "Execute commands from an instruction file or stdin")]
@@ -1113,6 +1146,7 @@ enum Command {
         /// (capped at 4 concurrent), bounding wall-clock to the slowest
         /// single check rather than waiting on the model to issue
         /// dispatches.
+        /// Checks with an explicit tool allowlist require the default orchestrator.
         #[arg(long = "no-orchestrate")]
         no_orchestrate: bool,
 
@@ -1314,8 +1348,6 @@ fn get_command_name(command: &Option<Command>) -> &'static str {
         Some(Command::Acp { .. }) => "acp",
         Some(Command::Serve { .. }) => "serve",
         Some(Command::Session { .. }) => "session",
-        Some(Command::Project {}) => "project",
-        Some(Command::Projects) => "projects",
         Some(Command::Run { .. }) => "run",
         Some(Command::Gateway { .. }) => "gateway",
         Some(Command::Schedule { .. }) => "schedule",
@@ -1348,14 +1380,23 @@ async fn handle_mcp_command(server: McpCommand) -> Result<()> {
     Ok(())
 }
 
-async fn handle_serve_command(
+struct ServeCommandArgs {
     host: String,
+
     port: u16,
     tls: bool,
     tls_cert_path: Option<String>,
     tls_key_path: Option<String>,
+    platform: ServePlatform,
     builtins: Vec<String>,
-) -> Result<()> {
+    dangerously_unauthenticated: bool,
+    allowed_origins: Vec<String>,
+    enable_scheduler: bool,
+}
+
+async fn handle_serve_command(args: ServeCommandArgs) -> Result<()> {
+    use axum::http::HeaderValue;
+    use goose::acp::server::AcpBuiltinSelection;
     use goose::acp::server_factory::{AcpServer, AcpServerFactoryConfig};
     use goose::acp::transport::create_router;
     use goose::config::paths::Paths;
@@ -1363,10 +1404,29 @@ async fn handle_serve_command(
     use std::sync::Arc;
     use tracing::{info, warn};
 
+    let ServeCommandArgs {
+        host,
+        port,
+        tls,
+        tls_cert_path,
+        tls_key_path,
+        platform,
+        builtins,
+        dangerously_unauthenticated,
+        allowed_origins,
+        enable_scheduler,
+    } = args;
+
     let builtins = if builtins.is_empty() {
-        vec!["developer".to_string()]
+        AcpBuiltinSelection {
+            defaults: vec!["developer".to_string()],
+            explicit: Vec::new(),
+        }
     } else {
-        builtins
+        AcpBuiltinSelection {
+            defaults: Vec::new(),
+            explicit: builtins,
+        }
     };
 
     let additional_source_roots = Config::global()
@@ -1385,22 +1445,47 @@ async fn handle_serve_command(
         builtins,
         data_dir: Paths::data_dir(),
         config_dir: Paths::config_dir(),
-        goose_platform: GoosePlatform::GooseCli,
+        goose_platform: platform.into(),
         additional_source_roots,
-        scheduler: None,
+        enable_scheduler,
     }));
     let env_secret = std::env::var(GOOSE_SERVER_SECRET_KEY_ENV)
         .ok()
         .map(|secret| secret.trim().to_string())
         .filter(|secret| !secret.is_empty());
     let require_token = env_secret.is_some();
-    if !require_token {
-        warn!(
-            "{GOOSE_SERVER_SECRET_KEY_ENV} is not set; the ACP endpoint will accept unauthenticated connections"
+    if !require_token && !dangerously_unauthenticated {
+        anyhow::bail!(
+            "{GOOSE_SERVER_SECRET_KEY_ENV} must be set to start `goose serve`; pass --dangerously-unauthenticated to run without ACP authentication"
         );
     }
+    if dangerously_unauthenticated && !require_token {
+        warn!(
+            "{GOOSE_SERVER_SECRET_KEY_ENV} is not set and --dangerously-unauthenticated was passed; the ACP endpoint will accept unauthenticated connections"
+        );
+    }
+    let additional_allowed_origins = allowed_origins
+        .into_iter()
+        .map(|origin| {
+            let origin = origin.trim();
+            if origin.is_empty() || origin == "*" {
+                anyhow::bail!("--allowed-origin must be a non-wildcard Origin value");
+            }
+            HeaderValue::from_str(origin).map_err(|error| {
+                anyhow::anyhow!("invalid --allowed-origin value `{origin}`: {error}")
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     let secret_key = env_secret.unwrap_or_else(generate_serve_secret_key);
-    let router = create_router(server, secret_key, require_token);
+    if let Err(error) = server.start_scheduler().await {
+        warn!("Scheduler failed to start; scheduled jobs will not run until a client connects: {error}");
+    }
+    let router = create_router(
+        server,
+        secret_key,
+        require_token,
+        additional_allowed_origins,
+    );
 
     let config = Config::global();
     let tls_cert_path =
@@ -1531,7 +1616,7 @@ async fn handle_session_subcommand(command: SessionCommand) -> Result<()> {
     Ok(())
 }
 
-async fn handle_interactive_session(
+struct InteractiveSessionArgs {
     identifier: Option<Identifier>,
     resume: bool,
     fork: bool,
@@ -1539,7 +1624,20 @@ async fn handle_interactive_session(
     history: bool,
     session_opts: SessionOptions,
     extension_opts: ExtensionOptions,
-) -> Result<()> {
+    model_opts: ModelOptions,
+}
+
+async fn handle_interactive_session(args: InteractiveSessionArgs) -> Result<()> {
+    let InteractiveSessionArgs {
+        identifier,
+        resume,
+        fork,
+        edit,
+        history,
+        session_opts,
+        extension_opts,
+        model_opts,
+    } = args;
     #[cfg(feature = "telemetry")]
     if get_telemetry_choice().is_none() {
         configure_telemetry_consent_dialog()?;
@@ -1614,8 +1712,8 @@ async fn handle_interactive_session(
         no_profile: extension_opts.no_profile,
         recipe: None,
         additional_system_prompt: None,
-        provider: None,
-        model: None,
+        provider: model_opts.provider,
+        model: model_opts.model,
         debug: session_opts.debug,
         max_tool_repetitions: session_opts.max_tool_repetitions,
         max_turns: session_opts.max_turns,
@@ -1770,7 +1868,9 @@ fn parse_run_input(
             Ok(Some((input_config, Some(recipe))))
         }
         (None, None, None) => {
-            eprintln!("Error: Must provide either --instructions (-i), --text (-t), or --recipe. Use -i - for stdin.");
+            eprintln!(
+                "Error: Must provide either --instructions (-i), --text (-t), or --recipe. Use -i - for stdin."
+            );
             std::process::exit(1);
         }
     }
@@ -1970,6 +2070,8 @@ async fn handle_local_models_command(command: LocalModelsCommand) -> Result<()> 
     use goose::providers::local_inference::hf_models;
     use goose::providers::local_inference::local_model_registry::get_registry;
 
+    goose::providers::local_inference::configure_huggingface_auth();
+
     match command {
         LocalModelsCommand::Search { query, limit } => {
             println!("Searching HuggingFace for '{}'...", query);
@@ -2136,10 +2238,6 @@ pub async fn cli() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    if let Err(e) = crate::project_tracker::update_project_tracker(None, None) {
-        warn!("Warning: Failed to update project tracker: {}", e);
-    }
-
     let command_name = get_command_name(&cli.command);
     tracing::info!(
         monotonic_counter.goose.cli_commands = 1,
@@ -2157,15 +2255,36 @@ pub async fn cli() -> anyhow::Result<()> {
         Some(Command::Doctor {}) => crate::commands::doctor::handle_doctor().await,
         Some(Command::Info { verbose, check }) => handle_info(verbose, check).await,
         Some(Command::Mcp { server }) => handle_mcp_command(server).await,
-        Some(Command::Acp { builtins }) => goose::acp::server::run(builtins).await,
+        Some(Command::Acp {
+            builtins,
+            enable_scheduler,
+        }) => goose::acp::server::run(builtins, enable_scheduler).await,
         Some(Command::Serve {
             host,
             port,
             tls,
             tls_cert_path,
             tls_key_path,
+            platform,
             builtins,
-        }) => handle_serve_command(host, port, tls, tls_cert_path, tls_key_path, builtins).await,
+            dangerously_unauthenticated,
+            allowed_origins,
+            enable_scheduler,
+        }) => {
+            handle_serve_command(ServeCommandArgs {
+                host,
+                port,
+                tls,
+                tls_cert_path,
+                tls_key_path,
+                platform,
+                builtins,
+                dangerously_unauthenticated,
+                allowed_origins,
+                enable_scheduler,
+            })
+            .await
+        }
         Some(Command::Session {
             command: Some(cmd), ..
         }) => handle_session_subcommand(cmd).await,
@@ -2178,8 +2297,9 @@ pub async fn cli() -> anyhow::Result<()> {
             history,
             session_opts,
             extension_opts,
+            model_opts,
         }) => {
-            handle_interactive_session(
+            handle_interactive_session(InteractiveSessionArgs {
                 identifier,
                 resume,
                 fork,
@@ -2187,16 +2307,9 @@ pub async fn cli() -> anyhow::Result<()> {
                 history,
                 session_opts,
                 extension_opts,
-            )
+                model_opts,
+            })
             .await
-        }
-        Some(Command::Project {}) => {
-            handle_project_default()?;
-            Ok(())
-        }
-        Some(Command::Projects) => {
-            handle_projects_interactive()?;
-            Ok(())
         }
         Some(Command::Run {
             input_opts,
@@ -2310,6 +2423,63 @@ mod tests {
     }
 
     #[test]
+    fn session_resume_accepts_provider_and_model_overrides() {
+        let cli = Cli::try_parse_from([
+            "goose",
+            "session",
+            "--resume",
+            "--provider",
+            "openai",
+            "--model",
+            "gpt-5.4",
+        ])
+        .expect("parse failed");
+
+        match cli.command {
+            Some(Command::Session {
+                resume, model_opts, ..
+            }) => {
+                assert!(resume);
+                assert_eq!(model_opts.provider.as_deref(), Some("openai"));
+                assert_eq!(model_opts.model.as_deref(), Some("gpt-5.4"));
+            }
+            _ => panic!("expected session command"),
+        }
+    }
+
+    #[test]
+    fn session_accepts_provider_override_without_resume() {
+        let cli = Cli::try_parse_from(["goose", "session", "--provider", "openai"])
+            .expect("provider override should work for a new session");
+
+        match cli.command {
+            Some(Command::Session {
+                resume, model_opts, ..
+            }) => {
+                assert!(!resume);
+                assert_eq!(model_opts.provider.as_deref(), Some("openai"));
+            }
+            _ => panic!("expected session command"),
+        }
+    }
+
+    #[test]
+    fn session_accepts_model_override_without_resume() {
+        let cli = Cli::try_parse_from(["goose", "session", "--model", "gpt-5.4"])
+            .expect("model override should work for a new session");
+
+        match cli.command {
+            Some(Command::Session {
+                resume, model_opts, ..
+            }) => {
+                assert!(!resume);
+                assert_eq!(model_opts.model.as_deref(), Some("gpt-5.4"));
+            }
+            _ => panic!("expected session command"),
+        }
+    }
+
+    #[test]
     fn nushell_completion_generation_emits_module() {
         let mut cmd = Cli::command();
         let mut buffer = Vec::new();
@@ -2359,6 +2529,35 @@ mod tests {
                 command: SkillsCommand::List,
             }) => {}
             _ => panic!("expected skills list command"),
+        }
+    }
+
+    #[test]
+    fn serve_command_accepts_dangerously_unauthenticated_flag() {
+        let cli = Cli::try_parse_from([
+            "goose",
+            "serve",
+            "--dangerously-unauthenticated",
+            "--allowed-origin",
+            "app://localhost",
+            "--allowed-origin",
+            "https://app.example",
+        ])
+        .expect("parse failed");
+
+        match cli.command {
+            Some(Command::Serve {
+                dangerously_unauthenticated,
+                allowed_origins,
+                ..
+            }) => {
+                assert!(dangerously_unauthenticated);
+                assert_eq!(
+                    allowed_origins,
+                    vec!["app://localhost", "https://app.example"]
+                );
+            }
+            _ => panic!("expected serve command"),
         }
     }
 

@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 #[cfg(all(feature = "rustls-tls", feature = "native-tls"))]
 compile_error!("Features `rustls-tls` and `native-tls` are mutually exclusive");
 
@@ -49,6 +51,7 @@ pub mod sources;
 pub mod subprocess;
 pub mod swarm;
 pub mod token_counter;
+mod tool_call_labels;
 pub mod tool_inspection;
 pub mod tool_monitor;
 pub mod tracing;
